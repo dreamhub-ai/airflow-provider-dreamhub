@@ -1,0 +1,71 @@
+name: Bug Report
+description: Report a bug in the Dreamhub Airflow provider
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill out the information below so we can investigate.
+        Do not paste API tokens, connection URIs with credentials, or customer data.
+
+  - type: input
+    id: provider-version
+    attributes:
+      label: Provider Version
+      description: "Run `pip show airflow-provider-dreamhub` and paste the version."
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: airflow-version
+    attributes:
+      label: Airflow Version
+      description: "e.g., 2.10.5, 3.3.2. Mention the hosting if managed (MWAA, Astronomer, Cloud Composer)."
+      placeholder: "3.3.2"
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python Version
+      placeholder: "3.12"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: The operator or hook call and its parameters (without credentials).
+      placeholder: |
+        1. DreamhubExtractOperator(entity="companies", ...)
+        2. Run the task
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+    validations:
+      required: false
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened. Include the task log error (remove any tokens).
+    validations:
+      required: false

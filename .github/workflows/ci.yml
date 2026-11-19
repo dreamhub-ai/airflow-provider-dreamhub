@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "ruff>=0.6"
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    name: Tests (Airflow ${{ matrix.airflow }}, Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { airflow: "2.9.3", python: "3.11" }
+          - { airflow: "2.10.5", python: "3.11" }
+          - { airflow: "3.3.2", python: "3.12" }
+          - { airflow: "3.4.0", python: "3.12" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install Airflow with its constraints
+        run: >
+          pip install "apache-airflow==${{ matrix.airflow }}"
+          --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${{ matrix.airflow }}/constraints-${{ matrix.python }}.txt"
+      - name: Install the provider
+        run: pip install -e ".[test]"
+      - name: Run tests
+        run: pytest --cov --cov-report=term --cov-fail-under=80
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+
+  e2e:
+    name: End-to-end (Dreamhub test environment)
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    env:
+      DREAMHUB_E2E_URL: ${{ secrets.DREAMHUB_E2E_URL }}
+      DREAMHUB_E2E_TOKEN: ${{ secrets.DREAMHUB_E2E_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Airflow with its constraints
+        run: >
+          pip install "apache-airflow==3.3.2"
+          --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.12.txt"
+      - run: pip install -e ".[test]"
+      - name: Run end-to-end tests
+        if: env.DREAMHUB_E2E_TOKEN != ''
+        run: pytest -m e2e -v
