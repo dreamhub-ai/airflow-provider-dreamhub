@@ -6,7 +6,7 @@ The file is NDJSON, one row per account, for example::
 
 ``account_number`` must be a field on the Dreamhub company (a custom field works) holding the same value.
 The other keys are the Dreamhub fields to update. Rows whose key matches no company, or more than one,
-are reported in the task result and fail the task.
+fail the task; their input positions are in the task log and, with their reasons, in the results file.
 """
 
 from __future__ import annotations

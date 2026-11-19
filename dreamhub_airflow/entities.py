@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import quote
 
 
 @dataclass(frozen=True)
@@ -28,11 +29,16 @@ class EntityRoute:
     def activities_of(cls, parent_entity: str, parent_id: str) -> EntityRoute:
         """Activities of one parent record (a company, deal, lead or person).
 
-        An account-wide activity read is planned at ``users/activities/filter``; until the API
-        offers it, activities are read per parent record.
+        The API has no account-wide activity read yet, so activities are read per parent record.
         """
+        if parent_id is None or not str(parent_id).strip():
+            raise ValueError("parent_id must name the parent record")
         parent = cls.for_entity(parent_entity)
-        return cls(name="activities", path=f"{parent.path}/{parent_id}/activities", items_key="activities")
+        return cls(
+            name="activities",
+            path=f"{parent.path}/{quote(str(parent_id).strip(), safe='')}/activities",
+            items_key="activities",
+        )
 
 
 KNOWN_ENTITIES: dict[str, EntityRoute] = {

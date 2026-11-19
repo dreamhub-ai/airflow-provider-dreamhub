@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import email.utils
+import math
 import time
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Hashable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -21,9 +23,14 @@ MAX_PAGE_SIZE = 100
 # The API refuses larger bulk requests.
 MAX_BULK_BATCH = 500
 DEFAULT_BULK_BATCH = 200
-MAX_RETRY_WAIT_SECONDS = 60.0
+DEFAULT_MAX_RETRIES = 5
+# Longest single wait for a rate limit, unless the connection's ``max_retry_wait`` extra says otherwise.
+DEFAULT_MAX_RETRY_WAIT_SECONDS = 300.0
+# Longest wait between retries of a gateway error or a dropped connection.
+MAX_BACKOFF_SECONDS = 60.0
 RETRYABLE_STATUSES = frozenset({502, 503, 504})
 BULK_OPERATIONS = ("create", "update", "upsert", "delete")
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 
 class DreamhubApiError(Exception):
@@ -46,8 +53,12 @@ class DreamhubConsistencyError(Exception):
 class BulkResult:
     """What a bulk write did, per record.
 
-    ``failures`` holds one entry per record that was not written: its ``key`` is the record's
-    Dreamhub id when known, otherwise its position in the input, and ``error`` says why.
+    ``failures`` holds one entry per record that was not written. Its ``key`` is the record's
+    Dreamhub id when it has one, otherwise its position (an int) in the records passed in.
+    An upsert with ``match_existing=True`` can also report a new record the API could not
+    create as ``"new record <n> of the batch starting at <position>"``: the API matched some
+    records of that batch to existing ones before creating the rest, so the position of a
+    record it could not create is not known. ``error`` says why the record was not written.
     """
 
     operation: str
@@ -72,12 +83,31 @@ class BulkResult:
         }
 
 
+class DreamhubBulkError(Exception):
+    """A bulk write stopped part-way. ``result`` holds what was written and what failed before it stopped.
+
+    The records of the batch that was in flight (``unknown_from`` to ``unknown_to``, input
+    positions, end exclusive) may or may not have been written.
+    """
+
+    def __init__(self, result: BulkResult, unknown_from: int, unknown_to: int, cause: Exception) -> None:
+        self.result = result
+        self.unknown_from = unknown_from
+        self.unknown_to = unknown_to
+        super().__init__(
+            f"Dreamhub bulk {result.operation} stopped: {cause}. {result.succeeded} records were written and "
+            f"{result.failed} failed before it stopped; records {unknown_from} to {unknown_to - 1} may or may not "
+            "have been written"
+        )
+
+
 class DreamhubHook(BaseHook):
     """Interact with the Dreamhub REST API.
 
     The connection's host is the API base URL (``https://crm.dreamhub.ai/api/v1`` when empty)
-    and its password is a Dreamhub API token. Optional extras: ``timeout`` (seconds, default 60)
-    and ``max_retries`` (default 5).
+    and its password is a Dreamhub API token. Optional extras: ``timeout`` (seconds, default 60),
+    ``max_retries`` (default 5) and ``max_retry_wait`` (longest single wait for a rate limit,
+    seconds, default 300).
     """
 
     conn_name_attr = "dreamhub_conn_id"
@@ -89,7 +119,8 @@ class DreamhubHook(BaseHook):
         super().__init__(**kwargs)
         self.dreamhub_conn_id = dreamhub_conn_id
         self._client: httpx.Client | None = None
-        self._max_retries = 5
+        self._max_retries = DEFAULT_MAX_RETRIES
+        self._max_retry_wait = DEFAULT_MAX_RETRY_WAIT_SECONDS
         self._sleep = time.sleep
 
     @classmethod
@@ -99,7 +130,7 @@ class DreamhubHook(BaseHook):
             "relabeling": {"host": "API base URL", "password": "API token"},
             "placeholders": {
                 "host": DEFAULT_BASE_URL,
-                "extra": '{"timeout": 60, "max_retries": 5}',
+                "extra": '{"timeout": 60, "max_retries": 5, "max_retry_wait": 300}',
             },
         }
 
@@ -109,10 +140,16 @@ class DreamhubHook(BaseHook):
             if not conn.password:
                 raise ValueError(f"Connection {self.dreamhub_conn_id!r} has no API token in its password field")
             extras = conn.extra_dejson or {}
-            self._max_retries = int(extras.get("max_retries", 5))
+            self._max_retries = int(extras.get("max_retries", DEFAULT_MAX_RETRIES))
+            self._max_retry_wait = float(extras.get("max_retry_wait", DEFAULT_MAX_RETRY_WAIT_SECONDS))
             base_url = (conn.host or DEFAULT_BASE_URL).rstrip("/")
             if "://" not in base_url:
                 base_url = f"https://{base_url}"
+            parts = urlsplit(base_url)
+            if parts.scheme != "https" and parts.hostname not in _LOCAL_HOSTS:
+                self.log.warning(
+                    "Connection %s does not use https; the API token is sent unencrypted", self.dreamhub_conn_id
+                )
             self._client = httpx.Client(
                 base_url=base_url,
                 timeout=float(extras.get("timeout", 60)),
@@ -141,6 +178,8 @@ class DreamhubHook(BaseHook):
             )
         except Exception as error:  # noqa: BLE001 - the UI shows the message
             return False, str(error)
+        finally:
+            self.close()
         return True, "Connection to Dreamhub succeeded"
 
     # ------------------------------------------------------------------ HTTP
@@ -155,37 +194,44 @@ class DreamhubHook(BaseHook):
         retry: bool = False,
         allow_not_found: bool = False,
     ) -> httpx.Response:
-        """Send one request, waiting out rate limits.
+        """Send one request to a path under the API base URL, waiting out rate limits.
 
-        A 429 is always retried after the server's ``Retry-After`` (capped), because the server
-        refused the request before doing anything. Gateway errors and timeouts are retried only
-        when ``retry`` is true: a write the server may already have applied is never resent.
+        ``path`` must be relative to the base URL: an absolute URL or a ``..`` segment is
+        refused, so the API token is only ever sent to the configured API.
+
+        A 429 is retried after the server's ``Retry-After`` (each wait at most
+        ``max_retry_wait`` seconds, at most ``max_retries`` times), because the server refused
+        the request before doing anything; after that the request fails. A connection that
+        could not be opened is retried for every method, since nothing was sent. Gateway
+        errors, timeouts and dropped connections are retried only when ``retry`` is true: a
+        write the server may already have applied is never resent.
         """
+        url = _relative_path(path)
         client = self.get_conn()
-        url = path.lstrip("/")
         attempt = 0
         while True:
             try:
                 response = client.request(method, url, params=params, json=json)
-            except httpx.TimeoutException:
-                if retry and attempt < self._max_retries:
+            except httpx.TransportError as error:
+                safe_to_resend = retry or isinstance(error, httpx.ConnectError)
+                if safe_to_resend and attempt < self._max_retries:
                     attempt += 1
-                    self._wait(self._backoff(attempt), method, path, "timed out")
+                    self._wait(self._backoff(attempt), method, url, type(error).__name__)
                     continue
                 raise
             status = response.status_code
             if status == 429 and attempt < self._max_retries:
                 attempt += 1
-                self._wait(self._retry_after(response, attempt), method, path, "rate limited")
+                self._wait(self._retry_after(response, attempt), method, url, "rate limited")
                 continue
             if retry and status in RETRYABLE_STATUSES and attempt < self._max_retries:
                 attempt += 1
-                self._wait(self._backoff(attempt), method, path, f"HTTP {status}")
+                self._wait(self._backoff(attempt), method, url, f"HTTP {status}")
                 continue
             if status == 404 and allow_not_found:
                 return response
             if status >= 400:
-                raise DreamhubApiError(method, path, status, _short_detail(response))
+                raise DreamhubApiError(method, url, status, _short_detail(response))
             return response
 
     def _wait(self, seconds: float, method: str, path: str, reason: str) -> None:
@@ -194,26 +240,26 @@ class DreamhubHook(BaseHook):
 
     @staticmethod
     def _backoff(attempt: int) -> float:
-        return min(2.0**attempt, MAX_RETRY_WAIT_SECONDS)
+        return min(2.0**attempt, MAX_BACKOFF_SECONDS)
 
-    @classmethod
-    def _retry_after(cls, response: httpx.Response, attempt: int) -> float:
+    def _retry_after(self, response: httpx.Response, attempt: int) -> float:
         """The server's ``Retry-After`` (seconds or an HTTP date), capped; our own backoff when absent or unreadable."""
         value = response.headers.get("Retry-After")
         if not value:
-            return cls._backoff(attempt)
+            return self._backoff(attempt)
         try:
-            return min(max(float(value), 0.0), MAX_RETRY_WAIT_SECONDS)
+            seconds = float(value)
         except ValueError:
-            pass
-        try:
-            parsed = email.utils.parsedate_to_datetime(value)
-        except (TypeError, ValueError):
-            return cls._backoff(attempt)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        seconds = (parsed - datetime.now(timezone.utc)).total_seconds()
-        return min(max(seconds, 0.0), MAX_RETRY_WAIT_SECONDS)
+            try:
+                parsed = email.utils.parsedate_to_datetime(value)
+            except (TypeError, ValueError):
+                return self._backoff(attempt)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            seconds = (parsed - datetime.now(timezone.utc)).total_seconds()
+        if math.isnan(seconds):
+            return self._backoff(attempt)
+        return min(max(seconds, 0.0), self._max_retry_wait)
 
     # ------------------------------------------------------------------ reads
 
@@ -236,7 +282,8 @@ class DreamhubHook(BaseHook):
         never loads a partial table believing it complete.
 
         ``parent=("companies", "<id>")`` reads activities of one record (``entity`` must be
-        ``"activities"``); the API has no account-wide activity read yet.
+        ``"activities"``); the API has no account-wide activity read yet. A parent record that
+        does not exist fails the read rather than reading as "no activities".
         """
         if not 1 <= page_size <= MAX_PAGE_SIZE:
             raise ValueError(f"page_size must be between 1 and {MAX_PAGE_SIZE}")
@@ -260,6 +307,9 @@ class DreamhubHook(BaseHook):
                 allow_not_found=True,
             )
             if response.status_code == 404:
+                if page == 1 and parent is not None:
+                    # For activities, a 404 says the parent record does not exist.
+                    raise DreamhubApiError("POST", f"{route.path}/filter", 404, _short_detail(response))
                 # The API answers "nothing matches" with 404. On a later page it only means
                 # there is nothing more; the count check below still catches a short read.
                 if page == 1:
@@ -272,6 +322,7 @@ class DreamhubHook(BaseHook):
             total = meta.get("total")
             if isinstance(total, int):
                 totals.add(total)
+            new_on_page = 0
             for row in rows:
                 row_id = row.get("id")
                 key = str(row_id) if row_id is not None else None
@@ -281,9 +332,12 @@ class DreamhubHook(BaseHook):
                     without_id += 1
                 else:
                     seen.add(key)
+                new_on_page += 1
                 yield row
             pages = meta.get("pages")
-            if len(rows) < page_size or (isinstance(pages, int) and page >= pages):
+            # Stop on a short page, on the last page, and on a page that brought nothing new
+            # (a server that ignores the page number would otherwise be read forever).
+            if len(rows) < page_size or (isinstance(pages, int) and page >= pages) or new_on_page == 0:
                 break
             page += 1
 
@@ -303,21 +357,46 @@ class DreamhubHook(BaseHook):
         """All matching records in memory. Prefer :meth:`iter_records` for large reads."""
         return list(self.iter_records(entity, filters, **kwargs))
 
-    def resolve_ids(self, entity: str, match_field: str, values: Iterable[Any]) -> dict[Any, list[str]]:
+    def resolve_ids(self, entity: str, match_field: str, values: Iterable[Any]) -> dict[str, list[str]]:
         """Map each value of ``match_field`` to the ids of the records holding it.
 
-        Works for any field the API can filter on, custom fields included. A value no record
-        holds maps to an empty list; a value several records hold maps to all their ids.
+        Works for any field the API can filter on, custom fields included. The result is keyed
+        by :meth:`match_key` of each value, so ``"42"`` read from a CSV file and ``42`` returned
+        by the API are the same value. A value no record holds maps to an empty list; a value
+        several records hold maps to all their ids. Values with no key (empty, or a list) are
+        left out.
         """
-        wanted = list(dict.fromkeys(v for v in values if v is not None))
-        found: dict[Any, list[str]] = {value: [] for value in wanted}
-        for start in range(0, len(wanted), MAX_PAGE_SIZE):
-            chunk = wanted[start : start + MAX_PAGE_SIZE]
+        wanted: dict[str, Any] = {}
+        for value in values:
+            key = self.match_key(value)
+            if key is not None and key not in wanted:
+                wanted[key] = value
+        found: dict[str, list[str]] = {key: [] for key in wanted}
+        keys = list(wanted)
+        for start in range(0, len(keys), MAX_PAGE_SIZE):
+            chunk = [wanted[key] for key in keys[start : start + MAX_PAGE_SIZE]]
             for row in self.iter_records(entity, {match_field: chunk}):
-                value = _field_value(row, match_field)
-                if value in found:
-                    found[value].append(str(row["id"]))
+                key = self.match_key(_field_value(row, match_field))
+                if key in found:
+                    found[key].append(str(row["id"]))
         return found
+
+    @staticmethod
+    def match_key(value: Any) -> str | None:
+        """The form two values of a match field are compared in, or None when the value cannot be matched.
+
+        Text is compared as written, apart from surrounding spaces; whole numbers compare equal
+        whatever their type (``"42"``, ``42`` and ``42.0``); booleans as ``true``/``false``.
+        An empty value, a list or an object has no key.
+        """
+        if value is None or isinstance(value, (list, dict, set)) or not isinstance(value, Hashable):
+            return None
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        text = str(value).strip()
+        return text or None
 
     @staticmethod
     def _route(entity: str, parent: tuple[str, str] | None) -> EntityRoute:
@@ -346,8 +425,11 @@ class DreamhubHook(BaseHook):
         ``override=False`` (the default) never clears a stored value with a null; ``True``
         writes nulls over stored values. For ``update`` and ``upsert``, every record that
         names an existing record carries its Dreamhub ``id``. ``delete`` takes records with
-        an ``id`` and soft-deletes them one by one (the API has no bulk delete yet).
-        A batch is never resent after an error the server may already have applied.
+        an ``id`` and soft-deletes them one request at a time (the API has no bulk delete
+        yet; ``batch_size`` and ``override`` do not apply).
+
+        A batch is never resent after an error the server may already have applied. If a batch
+        fails that way, :class:`DreamhubBulkError` is raised carrying everything reported so far.
         """
         if operation not in BULK_OPERATIONS:
             raise ValueError(f"operation must be one of {', '.join(BULK_OPERATIONS)}")
@@ -360,7 +442,12 @@ class DreamhubHook(BaseHook):
             return result
         for start in range(0, len(records), batch_size):
             batch = list(records[start : start + batch_size])
-            self._write_batch(route, operation, batch, start, result, override=override, match_existing=match_existing)
+            try:
+                self._write_batch(
+                    route, operation, batch, start, result, override=override, match_existing=match_existing
+                )
+            except (DreamhubApiError, httpx.HTTPError) as error:
+                raise DreamhubBulkError(result, start, start + len(batch), error) from error
         return result
 
     def _write_batch(
@@ -376,15 +463,15 @@ class DreamhubHook(BaseHook):
     ) -> None:
         if operation == "update":
             # The API skips update items without an id without reporting them; report them here.
-            missing = [i for i, record in enumerate(batch) if not record.get("id")]
-            for i in missing:
+            missing = {i for i, record in enumerate(batch) if not record.get("id")}
+            for i in sorted(missing):
                 result.failures.append({"key": offset + i, "error": "record has no id"})
-            batch_positions = [i for i in range(len(batch)) if i not in set(missing)]
-            batch = [batch[i] for i in batch_positions]
-            if not batch:
-                return
+            positions = [i for i in range(len(batch)) if i not in missing]
         else:
-            batch_positions = list(range(len(batch)))
+            positions = list(range(len(batch)))
+        sent = [batch[i] for i in positions]
+        if not sent:
+            return
 
         method, params = {
             "create": ("POST", {}),
@@ -392,21 +479,23 @@ class DreamhubHook(BaseHook):
             "upsert": ("PUT", {"override": _flag(override), "match_existing": _flag(match_existing)}),
         }[operation]
         try:
-            response = self.request(method, f"{route.path}/bulk/{operation}", params=params or None, json=batch)
+            response = self.request(method, f"{route.path}/bulk/{operation}", params=params or None, json=sent)
         except DreamhubApiError as error:
             if error.status_code == 500 and error.detail and "failed for all entities" in error.detail:
-                # Every record in the batch was rejected; the server reports it as a 500.
-                for position, record in zip(batch_positions, batch):
-                    result.failures.append({"key": record.get("id") or offset + position, "error": error.detail})
+                # Every record in the batch was rejected; the server reports it as a 500
+                # without a reason per record.
+                for position, record in zip(positions, sent):
+                    result.failures.append({"key": _record_key(record, offset + position), "error": error.detail})
                 return
             raise
         payload = response.json()
         result.succeeded_ids.extend(str(i) for i in payload.get("successfulIds") or [])
-        errors = payload.get("errors") or {}
-        reported = set()
-        for key, message in errors.items():
-            reported.add(str(key))
-            result.failures.append({"key": _input_key(key, batch, batch_positions, offset), "error": str(message)})
+        keys = _BatchKeys(sent, positions, offset, server_matched=operation == "upsert" and match_existing)
+        reported: set[str] = set()
+        for key, message in (payload.get("errors") or {}).items():
+            input_key = keys.resolve(str(key))
+            reported.add(str(input_key))
+            result.failures.append({"key": input_key, "error": str(message)})
         for failed_id in payload.get("failedIds") or []:
             if str(failed_id) not in reported:
                 result.failures.append({"key": str(failed_id), "error": "failed"})
@@ -418,29 +507,74 @@ class DreamhubHook(BaseHook):
                 result.failures.append({"key": position, "error": "record has no id"})
                 continue
             try:
-                self.request("DELETE", f"{route.path}/{record_id}")
+                self.request("DELETE", f"{route.path}/{quote(str(record_id), safe='')}")
+            except ValueError:
+                result.failures.append({"key": str(record_id), "error": "record id is not a valid id"})
+                continue
             except DreamhubApiError as error:
                 result.failures.append({"key": str(record_id), "error": error.detail or f"HTTP {error.status_code}"})
                 continue
+            except httpx.HTTPError as error:
+                raise DreamhubBulkError(result, position, position + 1, error) from error
             result.succeeded_ids.append(str(record_id))
+
+
+class _BatchKeys:
+    """Turns the API's error keys for one batch into keys the caller can find in its own input.
+
+    The API keys an error by record id, by the record's position in the list it was sent, and,
+    for upsert, as ``update_<id>`` or ``create_<n>`` where ``n`` counts only the records it
+    created. The list sent can be shorter than the caller's batch (update records without an id
+    are held back), so a position is mapped back to the record's id when it has one, else to
+    its input position.
+    """
+
+    def __init__(self, sent: list[dict[str, Any]], positions: list[int], offset: int, *, server_matched: bool) -> None:
+        self.sent = sent
+        self.positions = positions
+        self.offset = offset
+        # With match_existing the API may turn some id-less records into updates before
+        # creating the rest, so ``create_<n>`` cannot be traced to one input record.
+        self.server_matched = server_matched
+        self.new_records = [i for i, record in enumerate(sent) if not record.get("id")]
+
+    def resolve(self, key: str) -> Any:
+        if key.startswith("update_"):
+            return key[len("update_") :]
+        if key.startswith("create_"):
+            number = key[len("create_") :]
+            if not number.isdigit():
+                return key
+            if self.server_matched or int(number) >= len(self.new_records):
+                return f"new record {number} of the batch starting at {self.offset}"
+            return self._at(self.new_records[int(number)])
+        if key.isdigit() and int(key) < len(self.sent):
+            return self._at(int(key))
+        return key
+
+    def _at(self, index: int) -> Any:
+        return _record_key(self.sent[index], self.offset + self.positions[index])
+
+
+def _record_key(record: dict[str, Any], position: int) -> Any:
+    """A failure key: the record's Dreamhub id as text when it has one, else its input position."""
+    record_id = record.get("id")
+    return str(record_id) if record_id else position
+
+
+def _relative_path(path: str) -> str:
+    """``path`` as a path under the API base URL, refusing anything that would leave it."""
+    relative = path.lstrip("/")
+    parts = urlsplit(relative)
+    if parts.scheme or parts.netloc or "\\" in relative:
+        raise ValueError(f"path must be relative to the API base URL: {path!r}")
+    if any(segment in (".", "..") for segment in parts.path.split("/")):
+        raise ValueError(f"path must not contain '.' or '..' segments: {path!r}")
+    return relative
 
 
 def _flag(value: bool) -> str:
     return "true" if value else "false"
-
-
-def _input_key(key: Any, sent: list[dict[str, Any]], positions: list[int], offset: int) -> Any:
-    """Turn the API's error key into one the caller can find in its own input.
-
-    The API keys an error by record id, or by the record's position in the list it was sent.
-    That list can be shorter than the caller's batch (records without an id are not sent), so
-    a position is mapped back: to the record's id when it has one, else its input position.
-    """
-    text = str(key)
-    if not text.isdigit() or int(text) >= len(sent):
-        return text
-    record = sent[int(text)]
-    return str(record["id"]) if record.get("id") else offset + positions[int(text)]
 
 
 def _rows(payload: Any, items_key: str) -> list[dict[str, Any]]:

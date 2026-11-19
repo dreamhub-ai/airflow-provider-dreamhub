@@ -10,7 +10,7 @@ import respx
 
 from dreamhub_airflow.get_provider_info import get_provider_info
 from dreamhub_airflow.operators.api import DreamhubApiOperator
-from dreamhub_airflow.operators.bulk import DreamhubBulkFailure, DreamhubBulkOperator
+from dreamhub_airflow.operators.bulk import DreamhubBulkOperator, DreamhubRecordsFailedError
 from dreamhub_airflow.operators.extract import DreamhubExtractOperator
 from tests.helpers import BASE_URL
 
@@ -109,7 +109,7 @@ class TestBulk:
             return_value=httpx.Response(206, json={"successfulIds": ["c-1"], "errors": {"1": "bad"}})
         )
 
-        with pytest.raises(DreamhubBulkFailure, match="1 of 2 records failed"):
+        with pytest.raises(DreamhubRecordsFailedError, match="1 of 2 records failed"):
             DreamhubBulkOperator(
                 task_id="load", entity="companies", operation="create", records=[{"name": "A"}, {"name": ""}]
             ).execute({})
@@ -164,8 +164,8 @@ class TestBulk:
 
         assert json.loads(update.calls[0].request.content) == [{"external_key": "A", "seats": 10, "id": "c-1"}]
         assert summary["failures"] == [
-            {"key": "external_key='B'", "error": "2 records have this value"},
-            {"key": "external_key='Z'", "error": "no record has this value"},
+            {"key": 1, "error": "2 records have this external_key value"},
+            {"key": 2, "error": "no record has this external_key value"},
         ]
 
     @respx.mock
@@ -211,7 +211,7 @@ class TestBulk:
 
         assert json.loads(create.calls[0].request.content) == [
             {"email": "dana@example.com", "title": "CFO"},
-            {"email": "lee@example.com", "title": ""},
+            {"email": "lee@example.com", "title": None},
         ]
 
     def test_needs_exactly_one_source_of_records(self):

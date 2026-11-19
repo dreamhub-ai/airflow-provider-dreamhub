@@ -7,8 +7,8 @@ Apache Airflow provider for [Dreamhub](https://dreamhub.ai). Move Dreamhub data 
 - **Load** records in bulk: create, update, upsert or delete, with a per-record report of what failed and why.
 - **Call** any other Dreamhub API endpoint.
 
-Rate limits are handled for you: when Dreamhub answers `429`, the task waits as long as the API asks and
-continues instead of failing.
+Rate limits are handled for you: when Dreamhub answers `429`, the task waits as long as the API asks (up to
+5 minutes per wait, 5 times by default) and continues instead of failing.
 
 Works with Airflow 2.9+ and Airflow 3.
 
@@ -43,7 +43,12 @@ To write to S3 or GCS, also install the matching Airflow provider (`apache-airfl
    export AIRFLOW_CONN_DREAMHUB_DEFAULT='{"conn_type": "dreamhub", "password": "<your key>"}'
    ```
 
-   Optional extras: `{"timeout": 60, "max_retries": 5}`.
+   Optional extras: `{"timeout": 60, "max_retries": 5, "max_retry_wait": 300}`: request timeout in seconds,
+   how many times a rate-limited or failed request is retried, and the longest single wait for a rate limit
+   in seconds.
+
+The API token is only ever sent to the API base URL: operators refuse an endpoint or entity that is an
+absolute URL or contains `..`.
 
 Keys expire. Note the expiry date shown on the API Keys page and replace the key in the Airflow connection
 before then.
@@ -76,7 +81,8 @@ through XCom.
 | `neutralize_formulas` | CSV only. Values a spreadsheet would run as a formula (starting with `=`, `+`, `-`, `@`) get a leading `'`. On by default; set `False` when the file goes to a warehouse. |
 
 **Activities** are read per parent record: pass `entity="activities", parent_entity="companies",
-parent_id="<company id>"`.
+parent_id="<company id>"`. A parent record that does not exist fails the task rather than producing an empty
+file.
 
 **Completeness.** A read fails instead of producing a partial file: if the number of records the API reports
 changes during the read, or the rows read do not add up to it, the task raises `DreamhubConsistencyError` and
@@ -94,46 +100,54 @@ DreamhubBulkOperator(
     operation="update",
     input_path="s3://my-bucket/usage/{{ ds }}.ndjson",
     storage_conn_id="aws_default",
-    match_field="customer_account_number",  # a field on the Dreamhub company, custom fields included
+    match_field="account_number",  # a field on the Dreamhub company, custom fields included
 )
 ```
 
 | Parameter | Meaning |
 |---|---|
 | `operation` | `create`, `update`, `upsert` or `delete` |
-| `records` / `input_path` | The records, as a list (e.g. from XCom) or an NDJSON/CSV file |
-| `match_field` | For `update`, `upsert` and `delete`: find each record's Dreamhub id by this field instead of requiring an `id`. A value no record holds fails that record (`update`, `delete`) or creates a new record (`upsert`); a value held by several records fails that record. |
+| `records` / `input_path` | The records: a list of objects (e.g. `task.output` of an upstream task, or a JSON array rendered from XCom), or an NDJSON/CSV file. In CSV every value is text and an empty cell is null. |
+| `input_format` | `ndjson` (default) or `csv` |
+| `match_field` | For `update`, `upsert` and `delete`: find each record's Dreamhub id by this field instead of requiring an `id`. Values are compared as text, so `"42"` from a CSV file matches a stored `42`. A value no record holds fails that record (`update`, `delete`) or creates a new record (`upsert`); a value held by several records, or an empty value, fails that record. |
 | `override` | `False` (default): a null in your data never clears a stored value. `True`: nulls are written. |
 | `match_existing` | `upsert` only. Records without an id are matched on Dreamhub's natural keys (email for people; domain and name for companies) before a new one is created. Default `True`. |
 | `batch_size` | Records per API request, 1 to 500 (default 200) |
 | `fail_on_partial` | Fail the task when any record failed (default `True`) |
-| `results_path` | Also write the full result, with every failure, to this path |
+| `results_path` | Also write the full result, with every failure and its reason, to this path |
 
-The task returns `{"operation", "succeeded", "failed", "succeeded_ids", "failures"}`. Each failure has a `key`
-(the record's Dreamhub id; its position in your data; or `field=value` when `match_field` found no single
-match) and the `error`.
+The task returns `{"operation", "succeeded", "failed", "succeeded_ids", "failures"}`. Each failure has a `key`,
+the record's Dreamhub id or its position (0-based) in your data, and the `error`. One exception: an `upsert`
+with `match_existing=True` reports a new record Dreamhub could not create as `new record <n> of the batch
+starting at <position>`, because Dreamhub matched some records of that batch to existing ones first.
+
+The task log lists only the keys of failed records, never record values or failure reasons, so data such as
+emails stays out of logs. Set `results_path` to keep the reasons when the task fails.
 
 Notes:
 
 - `upsert` with `override=False` fills only fields that are empty in Dreamhub; `update` with `override=False`
   writes every non-null value you send.
-- A request that may already have been applied is never resent automatically. If a write times out, check
-  the records before running the task again.
+- A request that may already have been applied is never resent automatically. If a batch fails that way,
+  the task raises `DreamhubBulkError`: what was written and what failed before it stopped is logged and
+  written to `results_path`, and the error names the input positions whose outcome is unknown.
 - Records written before a task fails stay written. Running a `create` again creates them again, so for loads
   that may be retried, use `upsert` with `match_field`: a second run updates the records the first run made.
 - The task returns at most 100 failures and 1,000 ids; set `results_path` to keep the complete result.
-- `delete` is a soft delete of each record.
+- `delete` is a soft delete, one request per record; `batch_size` and `override` do not apply to it.
+- When every record of a batch fails, Dreamhub reports one reason for the whole batch.
 
 ## Other endpoints
 
 ```python
 from dreamhub_airflow.operators.api import DreamhubApiOperator
 
-DreamhubApiOperator(task_id="stages", endpoint="deals/stages")
+DreamhubApiOperator(task_id="stages", endpoint="deals/stages", query_params={"limit": 50})
 ```
 
-Reads are retried on gateway errors; writes are not, unless you set `retry_writes=True` for an endpoint that is
-safe to repeat.
+`endpoint`, `data` and `query_params` are templated. The JSON response is the task's return value, so it goes
+to XCom: use this for small responses. Reads are retried on gateway errors; writes are not, unless you set
+`retry_writes=True` for an endpoint that is safe to repeat.
 
 ## Using the hook directly
 
@@ -141,9 +155,12 @@ safe to repeat.
 from dreamhub_airflow.hooks.dreamhub import DreamhubHook
 
 hook = DreamhubHook()
-for company in hook.iter_records("companies", {"status": 1}):
-    ...
-result = hook.bulk("companies", "update", [{"id": "...", "seats": 10}])
+try:
+    for company in hook.iter_records("companies", {"status": 1}):
+        ...
+    result = hook.bulk("companies", "update", [{"id": "...", "seats": 10}])
+finally:
+    hook.close()
 ```
 
 ## Example DAGs
@@ -170,6 +187,8 @@ See [`example_dags/`](example_dags):
   create the user in your identity provider.
 - **`DreamhubConsistencyError`.** Records were added or removed while the extract was reading. Run the task
   again (see *Completeness* above).
+- **`DreamhubApiError` with HTTP 429 after several retries.** The rate limit lasted longer than the retry budget.
+  Raise `max_retries` or `max_retry_wait` in the connection extras, or run fewer tasks in parallel.
 
 ## Development
 

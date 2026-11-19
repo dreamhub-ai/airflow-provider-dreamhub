@@ -11,6 +11,7 @@ import respx
 from dreamhub_airflow.hooks.dreamhub import (
     MAX_BULK_BATCH,
     DreamhubApiError,
+    DreamhubBulkError,
     DreamhubConsistencyError,
     DreamhubHook,
 )
@@ -166,7 +167,7 @@ class TestRateLimitsAndRetries:
 
         hook.get_records("companies")
 
-        assert sleeps == [60.0]
+        assert sleeps == [300.0]
 
     @respx.mock
     def test_gives_up_after_max_retries(self, hook, sleeps):
@@ -193,7 +194,7 @@ class TestRateLimitsAndRetries:
     def test_a_gateway_error_on_a_write_is_never_resent(self, hook):
         route = respx.post(f"{BASE_URL}/companies/bulk/create").mock(return_value=httpx.Response(504))
 
-        with pytest.raises(DreamhubApiError):
+        with pytest.raises(DreamhubBulkError):
             hook.bulk("companies", "create", [{"name": "Acme"}])
 
         assert route.call_count == 1
@@ -273,7 +274,7 @@ class TestBulk:
             return_value=httpx.Response(500, json={"detail": "Internal server error"})
         )
 
-        with pytest.raises(DreamhubApiError):
+        with pytest.raises(DreamhubBulkError):
             hook.bulk("deals", "update", [{"id": "d-1"}])
 
     @respx.mock

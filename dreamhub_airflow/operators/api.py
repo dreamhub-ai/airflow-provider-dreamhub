@@ -18,14 +18,16 @@ class DreamhubApiOperator(BaseOperator):
     errors are retried only for read methods, or when ``retry_writes=True`` for an endpoint
     that is safe to repeat.
 
+    The whole JSON response is returned, and so pushed to XCom: use it for small responses.
+
     :param endpoint: Path under the API base URL, e.g. ``deals/stages``. Templated.
     :param method: HTTP method (default ``GET``).
     :param data: JSON body. Templated.
-    :param params: Query parameters. Templated.
+    :param query_params: Query parameters. Templated.
     """
 
-    template_fields: Sequence[str] = ("endpoint", "data", "params")
-    template_fields_renderers = {"data": "json", "params": "json"}
+    template_fields: Sequence[str] = ("endpoint", "data", "query_params")
+    template_fields_renderers = {"data": "json", "query_params": "json"}
 
     def __init__(
         self,
@@ -33,7 +35,7 @@ class DreamhubApiOperator(BaseOperator):
         endpoint: str,
         method: str = "GET",
         data: Any = None,
-        params: dict[str, Any] | None = None,
+        query_params: dict[str, Any] | None = None,
         retry_writes: bool = False,
         dreamhub_conn_id: str = DreamhubHook.default_conn_name,
         **kwargs: Any,
@@ -42,7 +44,7 @@ class DreamhubApiOperator(BaseOperator):
         self.endpoint = endpoint
         self.method = method.upper()
         self.data = data
-        self.params = params
+        self.query_params = query_params
         self.retry_writes = retry_writes
         self.dreamhub_conn_id = dreamhub_conn_id
 
@@ -52,7 +54,7 @@ class DreamhubApiOperator(BaseOperator):
             response = hook.request(
                 self.method,
                 self.endpoint,
-                params=self.params,
+                params=self.query_params,
                 json=self.data,
                 retry=self.method in READ_METHODS or self.retry_writes,
             )
