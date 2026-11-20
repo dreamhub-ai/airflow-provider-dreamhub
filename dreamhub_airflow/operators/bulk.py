@@ -135,7 +135,11 @@ class DreamhubBulkOperator(BaseOperator):
                 [positions[i] for i in partial.not_attempted],
                 partial.cause,
             )
-            self._finish(stopped.result, unknown=stopped.unknown, not_attempted=stopped.not_attempted)
+            try:
+                self._finish(stopped.result, unknown=stopped.unknown, not_attempted=stopped.not_attempted)
+            except Exception:
+                # The report is secondary: it must never replace the error that stopped the run.
+                self.log.exception("Could not write the partial result")
             if partial is error:
                 raise stopped from partial.cause
             raise

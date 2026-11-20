@@ -349,6 +349,45 @@ class TestARunThatStopsPartWay:
             [2],
         )
 
+    @respx.mock
+    def test_a_timeout_during_a_delete_keeps_airflows_exception_and_the_partial_result(
+        self, hook: DreamhubHook
+    ) -> None:
+        def timeout(request: httpx.Request) -> httpx.Response:
+            raise AirflowTaskTimeout("execution_timeout reached")
+
+        respx.delete(f"{BASE_URL}/tasks/t-1").mock(return_value=httpx.Response(204))
+        respx.delete(f"{BASE_URL}/tasks/t-2").mock(side_effect=timeout)
+
+        with pytest.raises(AirflowTaskTimeout) as raised:
+            hook.bulk("tasks", "delete", [{"id": "t-1"}, {"id": "t-2"}, {"id": "t-3"}])
+
+        partial = raised.value.dreamhub_partial
+        assert partial.result.succeeded_ids == ["t-1"]
+        assert (partial.unknown, partial.not_attempted) == ([1], [2])
+
+    @respx.mock
+    def test_a_report_that_cannot_be_written_does_not_hide_the_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def timeout(request: httpx.Request) -> httpx.Response:
+            raise AirflowTaskTimeout("execution_timeout reached")
+
+        def unwritable(self: object, rows: object) -> None:
+            raise OSError("disk full")
+
+        respx.post(f"{BASE_URL}/companies/bulk/create").mock(side_effect=timeout)
+        monkeypatch.setattr("dreamhub_airflow.operators.bulk.RecordFile.write", unwritable)
+
+        with pytest.raises(AirflowTaskTimeout):
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="create",
+                records=[{"name": "A"}],
+                results_path=str(tmp_path / "results.ndjson"),
+            ).execute({})
+
     def test_the_stop_error_survives_pickling(self) -> None:
         error = DreamhubBulkError(BulkResult("create", ["c-1"]), [1], [2], DreamhubApiError("POST", "x", 504))
 

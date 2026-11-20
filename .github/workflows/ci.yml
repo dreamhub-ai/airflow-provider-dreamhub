@@ -31,6 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - { airflow: "2.9.3", python: "3.10" }
           - { airflow: "2.9.3", python: "3.11" }
           - { airflow: "2.10.5", python: "3.11" }
           - { airflow: "3.3.2", python: "3.12" }
