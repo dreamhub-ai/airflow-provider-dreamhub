@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -13,19 +12,16 @@ from dreamhub_airflow.hooks.dreamhub import (
     BULK_OPERATIONS,
     DEFAULT_BULK_BATCH,
     MAX_BULK_BATCH,
-    NEW_RECORD_KEY,
     BulkResult,
     DreamhubBulkError,
     DreamhubHook,
     new_record_key,
+    parse_new_record_key,
 )
 
 # XCom is for small values: the task returns samples, and ``results_path`` holds everything.
 MAX_FAILURES_IN_XCOM = 100
 MAX_IDS_IN_XCOM = 1000
-_NEW_RECORD = re.compile(
-    re.escape(NEW_RECORD_KEY).replace(r"\{number\}", r"(?P<number>\d+)").replace(r"\{position\}", r"(?P<position>\d+)")
-)
 
 
 class DreamhubRecordsFailedError(Exception):
@@ -127,16 +123,22 @@ class DreamhubBulkOperator(BaseOperator):
                 override=self.override,
                 match_existing=self.match_existing,
             )
-        except DreamhubBulkError as error:
-            # Keep what was learned before the run stopped, in the caller's own positions, then fail.
+        except BaseException as error:
+            # Keep what was learned before the run stopped, in the caller's own positions. An error
+            # is re-raised with those positions; Airflow stopping the task is re-raised unchanged.
+            partial = error if isinstance(error, DreamhubBulkError) else getattr(error, "dreamhub_partial", None)
+            if not isinstance(partial, DreamhubBulkError):
+                raise
             stopped = DreamhubBulkError(
-                self._in_input_terms(error.result, positions, unmatched),
-                [positions[i] for i in error.unknown],
-                [positions[i] for i in error.not_attempted],
-                error.cause,
+                self._in_input_terms(partial.result, positions, unmatched),
+                [positions[i] for i in partial.unknown],
+                [positions[i] for i in partial.not_attempted],
+                partial.cause,
             )
             self._finish(stopped.result, unknown=stopped.unknown, not_attempted=stopped.not_attempted)
-            raise stopped from error.cause
+            if partial is error:
+                raise stopped from partial.cause
+            raise
         finally:
             hook.close()
         return self._report(self._in_input_terms(result, positions, unmatched))
@@ -199,13 +201,8 @@ class DreamhubBulkOperator(BaseOperator):
             key = failure["key"]
             if isinstance(key, int) and 0 <= key < len(positions):
                 failure = {**failure, "key": positions[key]}
-            elif isinstance(key, str):
-                found = _NEW_RECORD.fullmatch(key)
-                if found and int(found["position"]) < len(positions):
-                    failure = {
-                        **failure,
-                        "key": new_record_key(int(found["number"]), positions[int(found["position"])]),
-                    }
+            elif (parsed := parse_new_record_key(key)) is not None and parsed[1] < len(positions):
+                failure = {**failure, "key": new_record_key(parsed[0], positions[parsed[1]])}
             failures.append(failure)
         return BulkResult(operation=result.operation, succeeded_ids=result.succeeded_ids, failures=failures)
 

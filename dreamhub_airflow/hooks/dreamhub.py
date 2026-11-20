@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import email.utils
 import math
+import re
 import time
 from collections.abc import Hashable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
-from urllib.parse import quote, urlsplit
+from typing import Any, NoReturn
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
@@ -100,9 +102,9 @@ class DreamhubBulkError(Exception):
         self.cause = cause
         super().__init__(
             f"Dreamhub bulk {result.operation} stopped ({type(cause).__name__}). Before it stopped "
-            f"{result.succeeded} records were written and {result.failed} failed; {len(self.unknown)} records "
-            f"(input positions {_span(self.unknown)}) may or may not have been written and "
-            f"{len(self.not_attempted)} were not attempted"
+            f"{result.succeeded} records were written and {result.failed} failed; "
+            f"{_count_with_positions(self.unknown)} may or may not have been written and "
+            f"{_count_with_positions(self.not_attempted)} were not attempted"
         )
 
     def __reduce__(self) -> tuple[Any, ...]:
@@ -407,7 +409,7 @@ class DreamhubHook(BaseHook):
 
     @staticmethod
     def _route(entity: str) -> EntityRoute:
-        if entity.strip("/").split("/")[-1] == "activities":
+        if "activities" in unquote(entity).strip("/").split("/"):
             raise ValueError(
                 "activities cannot be read yet: the API has no correctly scoped read of activities by filter"
             )
@@ -434,14 +436,18 @@ class DreamhubHook(BaseHook):
         yet; ``batch_size`` and ``override`` do not apply).
 
         A batch is never resent after an error the server may already have applied. If the run
-        stops for any reason, :class:`DreamhubBulkError` is raised carrying everything reported so
-        far, the positions whose outcome is unknown and those never attempted.
+        stops on an error, :class:`DreamhubBulkError` is raised carrying everything reported so
+        far, the positions whose outcome is unknown and those never attempted. If Airflow stops
+        the task (a timeout or a kill), that exception is re-raised unchanged, with the same
+        report attached as its ``dreamhub_partial`` attribute.
         """
         if operation not in BULK_OPERATIONS:
             raise ValueError(f"operation must be one of {', '.join(BULK_OPERATIONS)}")
         if not 1 <= batch_size <= MAX_BULK_BATCH:
             raise ValueError(f"batch_size must be between 1 and {MAX_BULK_BATCH}")
         route = EntityRoute.for_entity(entity)
+        # A broken connection is a configuration error, raised before anything is attempted.
+        self.get_conn()
         result = BulkResult(operation=operation)
         if operation == "delete":
             self._delete_each(route, records, result)
@@ -452,11 +458,9 @@ class DreamhubHook(BaseHook):
                 self._write_batch(
                     route, operation, batch, start, result, override=override, match_existing=match_existing
                 )
-            except Exception as error:
+            except BaseException as error:
                 end = start + len(batch)
-                raise DreamhubBulkError(
-                    result, list(range(start, end)), list(range(end, len(records))), error
-                ) from error
+                _stop(DreamhubBulkError(result, list(range(start, end)), list(range(end, len(records))), error))
         return result
 
     def _write_batch(
@@ -493,7 +497,7 @@ class DreamhubHook(BaseHook):
             if error.status_code == 500 and error.detail and "failed for all entities" in error.detail:
                 # Every record in the batch was rejected; the server reports it as a 500
                 # without a reason per record.
-                for position, record in zip(positions, sent):
+                for position, record in zip(positions, sent, strict=True):
                     result.failures.append({"key": _record_key(record, offset + position), "error": error.detail})
                 return
             raise
@@ -511,28 +515,38 @@ class DreamhubHook(BaseHook):
 
     def _delete_each(self, route: EntityRoute, records: Sequence[dict[str, Any]], result: BulkResult) -> None:
         for position, record in enumerate(records):
+            key = _record_key(record, position)
             if not _has_id(record):
-                result.failures.append({"key": position, "error": "record has no id"})
+                result.failures.append({"key": key, "error": "record has no id"})
                 continue
-            record_id = str(record["id"])
             try:
-                path = _relative_path(f"{route.path}/{quote(record_id, safe='')}")
+                path = _relative_path(f"{route.path}/{quote(str(key), safe='')}")
             except ValueError:
-                result.failures.append({"key": record_id, "error": "record id is not a valid id"})
+                result.failures.append({"key": key, "error": "record id is not a valid id"})
                 continue
             try:
                 self.request("DELETE", path)
             except DreamhubApiError as error:
-                if error.status_code in (401, 403):
-                    # The credential, not the record: stop rather than fail every record the same way.
-                    raise DreamhubBulkError(
-                        result, [position], list(range(position + 1, len(records))), error
-                    ) from error
-                result.failures.append({"key": record_id, "error": error.detail or f"HTTP {error.status_code}"})
+                if error.status_code == 401:
+                    # The token was refused: every later record would fail the same way.
+                    result.failures.append({"key": key, "error": error.detail or "HTTP 401"})
+                    _stop(DreamhubBulkError(result, [], list(range(position + 1, len(records))), error))
+                result.failures.append({"key": key, "error": error.detail or f"HTTP {error.status_code}"})
                 continue
-            except Exception as error:
-                raise DreamhubBulkError(result, [position], list(range(position + 1, len(records))), error) from error
-            result.succeeded_ids.append(record_id)
+            except BaseException as error:
+                _stop(DreamhubBulkError(result, [position], list(range(position + 1, len(records))), error))
+            result.succeeded_ids.append(key)
+
+
+def _stop(report: DreamhubBulkError) -> NoReturn:
+    """Raise ``report`` for an error; for Airflow stopping the task, re-raise its own exception with
+    ``report`` attached, so the timeout or kill is still what Airflow sees."""
+    cause = report.cause
+    if isinstance(cause, Exception):
+        raise report from cause
+    with contextlib.suppress(AttributeError, TypeError):
+        cause.dreamhub_partial = report  # type: ignore[attr-defined]
+    raise cause
 
 
 class _BatchKeys:
@@ -579,15 +593,25 @@ class _BatchKeys:
 NEW_RECORD_KEY = "new record {number} of the batch starting at {position}"
 
 
+_NEW_RECORD_PATTERN = re.compile(r"new record (?P<number>\d+) of the batch starting at (?P<position>\d+)")
+
+
 def new_record_key(number: int, position: int) -> str:
     """The failure key of a new record the API could not create and that cannot be traced to one input."""
     return NEW_RECORD_KEY.format(number=number, position=position)
 
 
+def parse_new_record_key(key: Any) -> tuple[int, int] | None:
+    """``(number, position)`` from a key made by :func:`new_record_key`, else None."""
+    found = _NEW_RECORD_PATTERN.fullmatch(key) if isinstance(key, str) else None
+    return (int(found["number"]), int(found["position"])) if found else None
+
+
 def _has_id(record: dict[str, Any]) -> bool:
-    """Whether the API treats the record as naming an existing one (it ignores ``None``, blank and ``"None"``)."""
+    """Whether the API treats the record as naming an existing one: the same test the API applies
+    (an empty or false value, ``"None"`` and blank text name no record)."""
     value = record.get("id")
-    return value is not None and str(value).strip() not in ("", "None")
+    return bool(value) and value != "None" and bool(str(value).strip())
 
 
 def _query_value(value: Any) -> Any:
@@ -599,12 +623,14 @@ def _query_value(value: Any) -> Any:
     return value
 
 
-def _span(positions: list[int]) -> str:
+def _count_with_positions(positions: list[int]) -> str:
     if not positions:
-        return "none"
+        return "no records"
     if positions == list(range(positions[0], positions[-1] + 1)):
-        return f"{positions[0]} to {positions[-1]}"
-    return ", ".join(str(p) for p in positions[:20]) + (", ..." if len(positions) > 20 else "")
+        where = str(positions[0]) if len(positions) == 1 else f"{positions[0]} to {positions[-1]}"
+    else:
+        where = ", ".join(str(p) for p in positions[:20]) + (", ..." if len(positions) > 20 else "")
+    return f"{len(positions)} records (input positions {where})"
 
 
 def _record_key(record: dict[str, Any], position: int) -> Any:

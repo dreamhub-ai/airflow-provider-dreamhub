@@ -15,6 +15,7 @@ import httpx
 import pytest
 import respx
 from airflow import DAG
+from airflow.exceptions import AirflowTaskTimeout
 
 from dreamhub_airflow.hooks.dreamhub import BulkResult, DreamhubApiError, DreamhubBulkError, DreamhubHook
 from dreamhub_airflow.operators.api import DreamhubApiOperator
@@ -290,21 +291,63 @@ class TestARunThatStopsPartWay:
         monkeypatch.setenv("AIRFLOW_CONN_DREAMHUB_NOTOKEN", json.dumps({"conn_type": "dreamhub", "host": BASE_URL}))
         hook = DreamhubHook(dreamhub_conn_id="dreamhub_notoken")
 
-        with pytest.raises(DreamhubBulkError) as raised:
+        with pytest.raises(ValueError, match="no API token"):
             hook.bulk("tasks", "delete", [{"id": "t-1"}, {"id": "t-2"}])
-
-        assert isinstance(raised.value.cause, ValueError)
-        assert raised.value.result.failures == []
 
     @respx.mock
     def test_a_rejected_token_stops_a_delete(self, hook: DreamhubHook) -> None:
-        route = respx.delete(url__startswith=f"{BASE_URL}/tasks/").mock(return_value=httpx.Response(401))
+        route = respx.delete(url__startswith=f"{BASE_URL}/tasks/").mock(
+            return_value=httpx.Response(401, json={"detail": "Invalid token"})
+        )
 
         with pytest.raises(DreamhubBulkError) as raised:
             hook.bulk("tasks", "delete", [{"id": "t-1"}, {"id": "t-2"}])
 
         assert route.call_count == 1
-        assert raised.value.not_attempted == [1]
+        assert raised.value.result.failures == [{"key": "t-1", "error": "Invalid token"}]
+        assert (raised.value.unknown, raised.value.not_attempted) == ([], [1])
+
+    @respx.mock
+    def test_a_refused_record_fails_only_that_record(self, hook: DreamhubHook) -> None:
+        respx.delete(f"{BASE_URL}/tasks/t-1").mock(return_value=httpx.Response(403, json={"detail": "Not allowed"}))
+        respx.delete(f"{BASE_URL}/tasks/t-2").mock(return_value=httpx.Response(204))
+
+        result = hook.bulk("tasks", "delete", [{"id": "t-1"}, {"id": "t-2"}])
+
+        assert result.failures == [{"key": "t-1", "error": "Not allowed"}]
+        assert result.succeeded_ids == ["t-2"]
+
+    @respx.mock
+    def test_a_timeout_keeps_airflows_exception_and_still_writes_the_report(self, tmp_path: Path) -> None:
+        calls = iter([httpx.Response(201, json={"successfulIds": ["c-1"], "errors": {}})])
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            # Airflow raises its timeout inside whatever the task is doing, here the second request.
+            response = next(calls, None)
+            if response is None:
+                raise AirflowTaskTimeout("execution_timeout reached")
+            return response
+
+        respx.post(f"{BASE_URL}/companies/bulk/create").mock(side_effect=respond)
+        results = tmp_path / "results.ndjson"
+
+        with pytest.raises(AirflowTaskTimeout) as raised:
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="create",
+                records=[{"name": "A"}, {"name": "B"}, {"name": "C"}],
+                batch_size=1,
+                results_path=str(results),
+            ).execute({})
+
+        assert raised.value.dreamhub_partial.result.succeeded_ids == ["c-1"]
+        written = json.loads(results.read_text(encoding="utf-8"))
+        assert (written["succeeded_ids"], written["unknown_positions"], written["not_attempted_positions"]) == (
+            ["c-1"],
+            [1],
+            [2],
+        )
 
     def test_the_stop_error_survives_pickling(self) -> None:
         error = DreamhubBulkError(BulkResult("create", ["c-1"]), [1], [2], DreamhubApiError("POST", "x", 504))
@@ -452,14 +495,37 @@ class TestLocalFiles:
         assert stat.S_IMODE(target.stat().st_mode) == 0o644
 
     @respx.mock
-    def test_a_symlinked_destination_is_written_through(self, tmp_path: Path) -> None:
+    def test_a_symlink_at_the_destination_is_replaced_never_followed(self, tmp_path: Path) -> None:
+        # Following it would let whoever can place a link there redirect the write elsewhere.
         respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_page("companies", [{"id": "c-1"}]))
-        real = tmp_path / "real.ndjson"
-        real.write_text("old\n", encoding="utf-8")
-        link = tmp_path / "link.ndjson"
-        link.symlink_to(real)
+        elsewhere = tmp_path / "elsewhere.txt"
+        elsewhere.write_text("must not change\n", encoding="utf-8")
+        link = tmp_path / "companies.ndjson"
+        link.symlink_to(elsewhere)
 
         DreamhubExtractOperator(task_id="extract", entity="companies", output_path=str(link)).execute({})
 
-        assert link.is_symlink()
-        assert real.read_text(encoding="utf-8") == '{"id": "c-1"}\n'
+        assert not link.is_symlink()
+        assert link.read_text(encoding="utf-8") == '{"id": "c-1"}\n'
+        assert elsewhere.read_text(encoding="utf-8") == "must not change\n"
+
+
+class TestIdsAndEntitiesLikeTheApi:
+    @respx.mock
+    @pytest.mark.parametrize("record_id", [0, "", "None", "  "])
+    def test_values_the_api_ignores_as_ids_are_held_back_from_an_update(
+        self, hook: DreamhubHook, record_id: object
+    ) -> None:
+        route = respx.put(f"{BASE_URL}/companies/bulk/update").mock(
+            return_value=httpx.Response(200, json={"successfulIds": ["c-1"], "errors": {}})
+        )
+
+        result = hook.bulk("companies", "update", [{"id": "c-1"}, {"id": record_id}])
+
+        assert json.loads(route.calls[0].request.content) == [{"id": "c-1"}]
+        assert result.failures == [{"key": 1, "error": "record has no id"}]
+
+    @pytest.mark.parametrize("entity", ["activities", "companies/c-1/activities", "companies/c-1/%61ctivities"])
+    def test_every_spelling_of_an_activities_read_is_refused(self, hook: DreamhubHook, entity: str) -> None:
+        with pytest.raises(ValueError, match="activities cannot be read yet"):
+            hook.get_records(entity)

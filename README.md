@@ -2,7 +2,7 @@
 
 Apache Airflow provider for [Dreamhub](https://dreamhub.ai). Move Dreamhub data in and out of your pipelines:
 
-- **Extract** records of any entity, with a filter, to NDJSON or CSV, locally or in object storage
+- **Extract** records of the main entities (activities are not available yet), with a filter, to NDJSON or CSV, locally or in object storage
   (S3, GCS, Azure, through Airflow's `ObjectStoragePath`), then load the file into your warehouse.
 - **Load** records in bulk: create, update, upsert or delete, with a per-record report of what failed and why.
 - **Call** any other Dreamhub API endpoint.
@@ -10,7 +10,7 @@ Apache Airflow provider for [Dreamhub](https://dreamhub.ai). Move Dreamhub data 
 Rate limits are handled for you: when Dreamhub answers `429`, the task waits as long as the API asks (up to
 5 minutes per wait, 5 times by default) and continues instead of failing.
 
-Works with Airflow 2.9+ and Airflow 3.
+Works with Airflow 2.9+ and Airflow 3, on Python 3.10 or later.
 
 ## Install
 
@@ -119,17 +119,19 @@ starting at <position>`, because Dreamhub matched some records of that batch to 
 
 The task log lists only the keys of failed records, never record values or per-record reasons, so data such
 as emails stays out of logs. Set `results_path` to keep the reasons when the task fails. The reasons are
-Dreamhub's own messages; a validation message can quote the value it rejected, so treat the results file and
-the task's return value like the data you load.
+Dreamhub's own messages; a validation message can quote the value it rejected, so treat the results file, the
+task's return value and the traceback of a failed task like the data you load.
 
 Notes:
 
 - `upsert` with `override=False` fills only fields that are empty in Dreamhub; `update` with `override=False`
   writes every non-null value you send.
-- A request that may already have been applied is never resent automatically. If the run stops part-way, for
-  whatever reason, the task raises `DreamhubBulkError`: what was written and what failed before it stopped is
-  logged and written to `results_path`, together with `unknown_positions` (the batch in flight, which may or
-  may not have been written) and `not_attempted_positions`, all as positions in your data.
+- A request that may already have been applied is never resent automatically. If the run stops part-way,
+  what was written and what failed before it stopped is logged and written to `results_path`, together with
+  `unknown_positions` (the batch in flight, which may or may not have been written) and
+  `not_attempted_positions`, all as positions in your data. An error stops the task with `DreamhubBulkError`;
+  if Airflow stops the task (a timeout or a kill), its own exception is kept and the same report is written.
+- A refused API token (HTTP 401) stops a `delete` at the first record; other errors fail just that record.
 - Records written before a task fails stay written. Running a `create` again creates them again, so for loads
   that may be retried, use `upsert` with `match_field`: a second run updates the records the first run made.
 - The task returns at most 100 failures and 1,000 ids; set `results_path` to keep the complete result.
@@ -173,7 +175,8 @@ See [`example_dags/`](example_dags):
 ## Limitations
 
 - Each extract reads the full result of its filter (no incremental "changed since" read yet).
-- Activities cannot be read yet; this comes with a later release.
+- Activities cannot be read yet, because the Dreamhub API has no read of activities by filter that is scoped
+  correctly.
 - A bulk request carries at most 500 records; larger inputs are split automatically.
 
 ## Troubleshooting

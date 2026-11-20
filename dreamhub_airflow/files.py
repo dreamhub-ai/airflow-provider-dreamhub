@@ -6,6 +6,7 @@ import contextlib
 import csv
 import json
 import os
+import secrets
 import stat
 import tempfile
 from collections.abc import Iterable, Iterator, Sequence
@@ -55,16 +56,19 @@ class RecordFile:
     def _write_local(
         self, target: str, records: Iterable[dict[str, Any]], fields: Sequence[str] | None, neutralize_formulas: bool
     ) -> int:
-        # Write through a symlink to the file it names, and keep that file's permissions.
-        target = os.path.realpath(target)
+        # The destination itself is replaced, never a file a symlink there points to.
+        target = os.path.abspath(target)
         directory = os.path.dirname(target)
         os.makedirs(directory, exist_ok=True)
-        mode = _mode_for(target)
-        handle, staged = tempfile.mkstemp(dir=directory, prefix=".dreamhub-", suffix=".partial")
+        existing_mode = _regular_file_mode(target)
+        staged = os.path.join(directory, f".dreamhub-{secrets.token_hex(8)}.partial")
+        # O_EXCL never opens an existing file; the kernel applies the umask to 0o666 for a new one.
+        handle = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
         try:
             with os.fdopen(handle, "w", encoding="utf-8", newline="") as staged_file:
                 count = self._write_records(staged_file, records, fields, neutralize_formulas)
-            os.chmod(staged, mode)
+            if existing_mode is not None:
+                os.chmod(staged, existing_mode)
             os.replace(staged, target)
         except BaseException:
             with contextlib.suppress(FileNotFoundError):
@@ -133,14 +137,13 @@ class RecordFile:
         return count
 
 
-def _mode_for(target: str) -> int:
-    """The permissions the published file gets: the existing file's, else the usual default for a new file."""
+def _regular_file_mode(target: str) -> int | None:
+    """The permissions of an existing regular file at ``target`` (not followed through a symlink), else None."""
     try:
-        return stat.S_IMODE(os.stat(target).st_mode)
+        info = os.lstat(target)
     except FileNotFoundError:
-        umask = os.umask(0)
-        os.umask(umask)
-        return 0o666 & ~umask
+        return None
+    return stat.S_IMODE(info.st_mode) if stat.S_ISREG(info.st_mode) else None
 
 
 def _local_path(path: str) -> str | None:

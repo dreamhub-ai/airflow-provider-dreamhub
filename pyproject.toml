@@ -9,7 +9,7 @@ description = "Apache Airflow provider for Dreamhub: extract records to files or
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [{ name = "Dreamhub" }]
 keywords = ["airflow", "airflow-provider", "dreamhub", "crm", "etl"]
 classifiers = [
@@ -27,7 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "pytest>=8",
+    "pytest>=7.4",
     "pytest-cov>=5",
     "respx>=0.21",
 ]
@@ -66,7 +66,7 @@ show_missing = true
 
 [tool.ruff]
 line-length = 120
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "B", "UP"]
