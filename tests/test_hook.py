@@ -333,6 +333,8 @@ class TestBulk:
         assert "alice" not in message
         # The API's own words stay available to the caller, which reports them per record.
         assert raised.value.item_errors[0].startswith("email: Value error")
+        # The per-record reason locates the field as the API did, unmasked.
+        assert "custom.alice@example.com: Field required" in raised.value.item_errors[0]
 
     @respx.mock
     def test_free_text_from_the_api_is_kept_off_the_message(self, hook):

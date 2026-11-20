@@ -42,7 +42,8 @@ class DreamhubApiError(Exception):
 
     ``detail`` and ``item_errors`` are the API's own words and can quote a value it rejected,
     so they are kept off the message, which ends up in task logs. The message carries only
-    ``summary``: the fields at fault and the type of each error.
+    ``summary``: the fields at fault and the type of each error, or a fixed description the
+    hook itself wrote.
     """
 
     def __init__(
@@ -746,8 +747,9 @@ class _ValidationEntry:
     def parse(cls, entry: Any) -> _ValidationEntry | None:
         """The entry, or ``None`` when it is not shaped like a validation error.
 
-        The entry's ``input`` holds the rejected value and is never read. A location part that
-        is not a plain name (a key taken from the data, for example) is shown as ``?``.
+        The entry's ``input`` holds the rejected value and is never read. ``reason`` names the
+        field as the API located it. ``summary`` shows a location part that is not a plain name
+        (letters, digits and underscores) as ``?``; a name-shaped key is kept.
         """
         if not isinstance(entry, dict) or not isinstance(entry.get("msg"), str):
             return None
@@ -758,13 +760,14 @@ class _ValidationEntry:
         item = None
         if parts and isinstance(parts[0], int) and not isinstance(parts[0], bool):
             item, parts = parts[0], parts[1:]
-        field = ".".join(cls._safe_part(part) for part in parts)
+        location = ".".join(str(part) for part in parts)
+        safe_location = ".".join(cls._safe_part(part) for part in parts)
         kind = entry.get("type")
         kind = kind if isinstance(kind, str) and cls._NAME.fullmatch(kind) else "invalid"
         return cls(
             item=item,
-            reason=f"{field}: {entry['msg']}" if field else entry["msg"],
-            summary=f"{field}: {kind}" if field else kind,
+            reason=f"{location}: {entry['msg']}" if location else entry["msg"],
+            summary=f"{safe_location}: {kind}" if safe_location else kind,
         )
 
     @classmethod
@@ -800,7 +803,7 @@ class _ErrorBody:
                 by_item.setdefault(entry.item, []).append(entry.reason)
         return cls(
             detail=_joined(entry.reason for entry in entries),
-            item_errors={item: "; ".join(reasons)[:MAX_DETAIL_CHARS] for item, reasons in by_item.items()},
+            item_errors={item: _joined(reasons) or "" for item, reasons in by_item.items()},
             summary=_joined(entry.summary for entry in entries),
         )
 

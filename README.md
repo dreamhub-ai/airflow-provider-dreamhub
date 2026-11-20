@@ -192,6 +192,9 @@ See [`example_dags/`](example_dags):
 
 - **Every request returns HTTP 401.** The API key has expired or was revoked, or the Dreamhub user it belongs
   to was deactivated. Check the key on **Settings → API Keys** and replace it in the Airflow connection.
+- **The log shows only `failed with HTTP <status>`.** The task log never carries Dreamhub's own error text,
+  because it can quote your data. The text is on the raised `DreamhubApiError` as `detail`, and for bulk loads
+  each record's reason is in the task's return value and in `results_path`.
 - **The integration user was deactivated without anyone doing it.** If your Dreamhub account provisions users
   from your identity provider (SCIM), a user that does not exist there is deactivated when the two are
   reconciled. Ask your Dreamhub admin to exclude the integration user's email from SCIM deprovisioning, or

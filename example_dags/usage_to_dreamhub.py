@@ -2,10 +2,10 @@
 
 The file is NDJSON, one row per account, for example::
 
-    {"account_number": "A-1001", "active_seats": 42, "last_login_at": "2026-11-18"}
+    {"account_number": "A-1001", "name": "Acme", "status": 1, "active_seats": 42, "last_login_at": "2026-11-18"}
 
 ``account_number`` must be a field on the Dreamhub company (a custom field works) holding the same value.
-The other keys are the Dreamhub fields to update. Rows whose key matches no company, or more than one,
+The other keys are the Dreamhub fields to write. Rows whose key matches no company, or more than one,
 fail the task; their input positions are in the task log and, with their reasons, in the results file.
 
 Until Dreamhub accepts partial records in bulk updates, each row must also carry every field that creating a
