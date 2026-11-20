@@ -17,7 +17,7 @@ welcome community contributions.
    python -m venv .venv
    .venv/bin/pip install "apache-airflow==3.3.2" \
      --constraint https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.12.txt
-   .venv/bin/pip install -e ".[test]"
+   .venv/bin/pip install -e ".[test,lint]"
    ```
 4. Run the checks:
    ```bash

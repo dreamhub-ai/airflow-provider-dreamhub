@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from urllib.parse import quote
 
 
 @dataclass(frozen=True)
@@ -24,21 +23,6 @@ class EntityRoute:
         if not path:
             raise ValueError("entity must not be empty")
         return cls(name=entity, path=path, items_key=path.rsplit("/", 1)[-1])
-
-    @classmethod
-    def activities_of(cls, parent_entity: str, parent_id: str) -> EntityRoute:
-        """Activities of one parent record (a company, deal, lead or person).
-
-        The API has no account-wide activity read yet, so activities are read per parent record.
-        """
-        if parent_id is None or not str(parent_id).strip():
-            raise ValueError("parent_id must name the parent record")
-        parent = cls.for_entity(parent_entity)
-        return cls(
-            name="activities",
-            path=f"{parent.path}/{quote(str(parent_id).strip(), safe='')}/activities",
-            items_key="activities",
-        )
 
 
 KNOWN_ENTITIES: dict[str, EntityRoute] = {

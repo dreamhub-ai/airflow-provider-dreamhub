@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -12,14 +13,19 @@ from dreamhub_airflow.hooks.dreamhub import (
     BULK_OPERATIONS,
     DEFAULT_BULK_BATCH,
     MAX_BULK_BATCH,
+    NEW_RECORD_KEY,
     BulkResult,
     DreamhubBulkError,
     DreamhubHook,
+    new_record_key,
 )
 
 # XCom is for small values: the task returns samples, and ``results_path`` holds everything.
 MAX_FAILURES_IN_XCOM = 100
 MAX_IDS_IN_XCOM = 1000
+_NEW_RECORD = re.compile(
+    re.escape(NEW_RECORD_KEY).replace(r"\{number\}", r"(?P<number>\d+)").replace(r"\{position\}", r"(?P<position>\d+)")
+)
 
 
 class DreamhubRecordsFailedError(Exception):
@@ -30,8 +36,9 @@ class DreamhubBulkOperator(BaseOperator):
     """Write records to Dreamhub in bulk and report which ones failed and why.
 
     Records come from ``records`` (a list of objects, e.g. ``task.output`` of an upstream task,
-    or a JSON string such as a rendered XCom pull) or from ``input_path`` (an NDJSON or CSV
-    file, local or in object storage). In CSV every value is text and an empty cell is null.
+    or a JSON array as text, e.g. ``"{{ ti.xcom_pull('upstream') | tojson }}"``) or from
+    ``input_path`` (an NDJSON or CSV file, local or in object storage). In CSV every value is
+    text and an empty cell is null.
 
     :param entity: Entity type, e.g. ``companies``.
     :param operation: ``create``, ``update``, ``upsert`` or ``delete``. ``delete`` soft-deletes
@@ -121,9 +128,15 @@ class DreamhubBulkOperator(BaseOperator):
                 match_existing=self.match_existing,
             )
         except DreamhubBulkError as error:
-            # Keep what was learned before the run stopped, then let the task fail.
-            self._finish(self._in_input_terms(error.result, positions, unmatched))
-            raise
+            # Keep what was learned before the run stopped, in the caller's own positions, then fail.
+            stopped = DreamhubBulkError(
+                self._in_input_terms(error.result, positions, unmatched),
+                [positions[i] for i in error.unknown],
+                [positions[i] for i in error.not_attempted],
+                error.cause,
+            )
+            self._finish(stopped.result, unknown=stopped.unknown, not_attempted=stopped.not_attempted)
+            raise stopped from error.cause
         finally:
             hook.close()
         return self._report(self._in_input_terms(result, positions, unmatched))
@@ -186,12 +199,28 @@ class DreamhubBulkOperator(BaseOperator):
             key = failure["key"]
             if isinstance(key, int) and 0 <= key < len(positions):
                 failure = {**failure, "key": positions[key]}
+            elif isinstance(key, str):
+                found = _NEW_RECORD.fullmatch(key)
+                if found and int(found["position"]) < len(positions):
+                    failure = {
+                        **failure,
+                        "key": new_record_key(int(found["number"]), positions[int(found["position"])]),
+                    }
             failures.append(failure)
         return BulkResult(operation=result.operation, succeeded_ids=result.succeeded_ids, failures=failures)
 
-    def _finish(self, result: BulkResult) -> dict[str, Any]:
-        """Write the full result where asked and log what happened, without record values or reasons."""
+    def _finish(
+        self, result: BulkResult, *, unknown: list[int] | None = None, not_attempted: list[int] | None = None
+    ) -> dict[str, Any]:
+        """Write the full result where asked and log what happened, without record values or reasons.
+
+        For a run that stopped part-way, the summary also lists the input positions whose
+        outcome is unknown and those never attempted.
+        """
         summary = result.to_dict()
+        if unknown is not None:
+            summary["unknown_positions"] = unknown
+            summary["not_attempted_positions"] = not_attempted or []
         if self.results_path:
             RecordFile(self.results_path, "ndjson", conn_id=self.storage_conn_id).write([summary])
         self.log.info(

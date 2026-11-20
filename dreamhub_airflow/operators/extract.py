@@ -18,19 +18,17 @@ class DreamhubExtractOperator(BaseOperator):
     ``{"path": ..., "count": ...}``; the records themselves never go through XCom.
 
     :param entity: ``companies``, ``deals``, ``leads``, ``people``, ``contracts``,
-        ``revenue_items``, ``tasks``, ``partners``, ``users``, ``activities``, or an API path.
+        ``revenue_items``, ``tasks``, ``partners``, ``users``, or an API path.
     :param output_path: Where to write the file. Templated.
     :param filters: Dreamhub filter object, e.g. ``{"status": 1}``. Templated.
     :param file_format: ``ndjson`` (default) or ``csv``.
     :param fields: Keep only these fields, in this order.
     :param include_additionals: Also return fields from the additional fields tab.
-    :param parent_entity: With ``entity="activities"``, the parent entity type (e.g. ``companies``).
-    :param parent_id: With ``entity="activities"``, the parent record id. Templated.
     :param neutralize_formulas: CSV only. Prefix values a spreadsheet would run as a formula
         with ``'`` (default). Set False when loading the file into a warehouse.
     """
 
-    template_fields: Sequence[str] = ("entity", "output_path", "filters", "parent_id")
+    template_fields: Sequence[str] = ("entity", "output_path", "filters")
     template_fields_renderers = {"filters": "json"}
     ui_color = "#e8f4fd"
 
@@ -44,8 +42,6 @@ class DreamhubExtractOperator(BaseOperator):
         fields: Sequence[str] | None = None,
         include_additionals: bool = False,
         page_size: int = MAX_PAGE_SIZE,
-        parent_entity: str | None = None,
-        parent_id: str | None = None,
         neutralize_formulas: bool = True,
         dreamhub_conn_id: str = DreamhubHook.default_conn_name,
         storage_conn_id: str | None = None,
@@ -59,21 +55,17 @@ class DreamhubExtractOperator(BaseOperator):
         self.fields = list(fields) if fields is not None else None
         self.include_additionals = include_additionals
         self.page_size = page_size
-        self.parent_entity = parent_entity
-        self.parent_id = parent_id
         self.neutralize_formulas = neutralize_formulas
         self.dreamhub_conn_id = dreamhub_conn_id
         self.storage_conn_id = storage_conn_id
 
     def execute(self, context: Any) -> dict[str, Any]:
         hook = DreamhubHook(dreamhub_conn_id=self.dreamhub_conn_id)
-        parent = (self.parent_entity, self.parent_id) if self.parent_entity else None
         records = hook.iter_records(
             self.entity,
             self.filters,
             page_size=self.page_size,
             include_additionals=self.include_additionals,
-            parent=parent,
         )
         target = RecordFile(self.output_path, self.file_format, conn_id=self.storage_conn_id)
         try:

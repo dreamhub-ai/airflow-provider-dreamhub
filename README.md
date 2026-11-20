@@ -72,17 +72,13 @@ through XCom.
 
 | Parameter | Meaning |
 |---|---|
-| `entity` | `companies`, `deals`, `leads`, `people`, `contracts`, `revenue_items`, `tasks`, `partners`, `users`, or `activities` (see below) |
+| `entity` | `companies`, `deals`, `leads`, `people`, `contracts`, `revenue_items`, `tasks`, `partners` or `users` |
 | `filters` | A Dreamhub filter, e.g. `{"status": 1, "amount": {"gte": 50000}, "region": ["EMEA", "NA"]}`. Custom fields can be filtered by their key. |
 | `output_path` | Local path or object-storage URI. Templated. |
 | `file_format` | `ndjson` (default) or `csv` |
 | `fields` | Keep only these fields, in this order |
 | `include_additionals` | Also return the fields from the additional fields tab |
 | `neutralize_formulas` | CSV only. Values a spreadsheet would run as a formula (starting with `=`, `+`, `-`, `@`) get a leading `'`. On by default; set `False` when the file goes to a warehouse. |
-
-**Activities** are read per parent record: pass `entity="activities", parent_entity="companies",
-parent_id="<company id>"`. A parent record that does not exist fails the task rather than producing an empty
-file.
 
 **Completeness.** A read fails instead of producing a partial file: if the number of records the API reports
 changes during the read, or the rows read do not add up to it, the task raises `DreamhubConsistencyError` and
@@ -121,16 +117,19 @@ the record's Dreamhub id or its position (0-based) in your data, and the `error`
 with `match_existing=True` reports a new record Dreamhub could not create as `new record <n> of the batch
 starting at <position>`, because Dreamhub matched some records of that batch to existing ones first.
 
-The task log lists only the keys of failed records, never record values or failure reasons, so data such as
-emails stays out of logs. Set `results_path` to keep the reasons when the task fails.
+The task log lists only the keys of failed records, never record values or per-record reasons, so data such
+as emails stays out of logs. Set `results_path` to keep the reasons when the task fails. The reasons are
+Dreamhub's own messages; a validation message can quote the value it rejected, so treat the results file and
+the task's return value like the data you load.
 
 Notes:
 
 - `upsert` with `override=False` fills only fields that are empty in Dreamhub; `update` with `override=False`
   writes every non-null value you send.
-- A request that may already have been applied is never resent automatically. If a batch fails that way,
-  the task raises `DreamhubBulkError`: what was written and what failed before it stopped is logged and
-  written to `results_path`, and the error names the input positions whose outcome is unknown.
+- A request that may already have been applied is never resent automatically. If the run stops part-way, for
+  whatever reason, the task raises `DreamhubBulkError`: what was written and what failed before it stopped is
+  logged and written to `results_path`, together with `unknown_positions` (the batch in flight, which may or
+  may not have been written) and `not_attempted_positions`, all as positions in your data.
 - Records written before a task fails stay written. Running a `create` again creates them again, so for loads
   that may be retried, use `upsert` with `match_field`: a second run updates the records the first run made.
 - The task returns at most 100 failures and 1,000 ids; set `results_path` to keep the complete result.
@@ -174,7 +173,7 @@ See [`example_dags/`](example_dags):
 ## Limitations
 
 - Each extract reads the full result of its filter (no incremental "changed since" read yet).
-- Activities are read per parent record.
+- Activities cannot be read yet; this comes with a later release.
 - A bulk request carries at most 500 records; larger inputs are split automatically.
 
 ## Troubleshooting

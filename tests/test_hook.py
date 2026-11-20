@@ -112,16 +112,8 @@ class TestReading:
 
         assert hook.get_records("revenue_items") == [{"id": "ri-1"}]
 
-    @respx.mock
-    def test_activities_are_read_through_their_parent_record(self, hook):
-        respx.post(f"{BASE_URL}/companies/c-1/activities/filter").mock(
-            return_value=_page("activities", [{"id": "a-1"}], total=1, page=1)
-        )
-
-        assert hook.get_records("activities", parent=("companies", "c-1")) == [{"id": "a-1"}]
-
-    def test_activities_without_a_parent_are_refused(self, hook):
-        with pytest.raises(ValueError, match="per parent record"):
+    def test_activities_are_refused_until_the_api_can_scope_them(self, hook):
+        with pytest.raises(ValueError, match="activities cannot be read yet"):
             hook.get_records("activities")
 
     def test_a_page_larger_than_the_api_allows_is_refused(self, hook):

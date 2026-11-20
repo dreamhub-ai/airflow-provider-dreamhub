@@ -4,16 +4,19 @@ failure reports, how values are matched, and what survives a run that stops part
 from __future__ import annotations
 
 import json
-import logging
+import os
+import pickle
+import stat
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
 import respx
 from airflow import DAG
 
-from dreamhub_airflow.hooks.dreamhub import DreamhubApiError, DreamhubBulkError, DreamhubHook
+from dreamhub_airflow.hooks.dreamhub import BulkResult, DreamhubApiError, DreamhubBulkError, DreamhubHook
 from dreamhub_airflow.operators.api import DreamhubApiOperator
 from dreamhub_airflow.operators.bulk import DreamhubBulkOperator
 from dreamhub_airflow.operators.extract import DreamhubExtractOperator
@@ -47,7 +50,9 @@ class TestDagsWithEveryOperatorLoad:
 
 
 class TestTheTokenOnlyGoesToTheApi:
-    @pytest.mark.parametrize("path", ["https://elsewhere.example/x", "companies/1/../../../x", "./companies"])
+    @pytest.mark.parametrize(
+        "path", ["https://elsewhere.example/x", "companies/1/../../../x", "./companies", "deals?limit=1", "deals#x"]
+    )
     def test_a_path_that_would_leave_the_api_is_refused_before_sending(self, hook: DreamhubHook, path: str) -> None:
         with respx.mock(assert_all_called=False) as router:
             route = router.route().mock(return_value=httpx.Response(200, json={}))
@@ -84,24 +89,6 @@ class TestTheTokenOnlyGoesToTheApi:
         assert route.calls[0].request.url.raw_path == b"/api/v1/tasks/a%2Fb%3Fc"
         assert result.succeeded_ids == ["a/b?c"]
         assert result.failures == [{"key": "..", "error": "record id is not a valid id"}]
-
-
-class TestActivitiesOfAMissingParent:
-    @respx.mock
-    def test_a_parent_that_does_not_exist_fails_the_read(self, hook: DreamhubHook) -> None:
-        respx.post(f"{BASE_URL}/companies/c-gone/activities/filter").mock(
-            return_value=httpx.Response(404, json={"detail": "Entity with id c-gone not found"})
-        )
-
-        with pytest.raises(DreamhubApiError) as raised:
-            hook.get_records("activities", parent=("companies", "c-gone"))
-
-        assert raised.value.status_code == 404
-
-    @pytest.mark.parametrize("parent_id", [None, "", "  "])
-    def test_a_blank_parent_id_is_refused(self, hook: DreamhubHook, parent_id: str | None) -> None:
-        with pytest.raises(ValueError, match="parent_id"):
-            hook.get_records("activities", parent=("companies", parent_id))
 
 
 class TestUpsertFailureKeys:
@@ -186,19 +173,40 @@ class TestMatching:
         assert summary["failures"] == [{"key": 0, "error": "record has no usable account_number value"}]
 
     @respx.mock
-    def test_match_values_never_reach_the_task_log(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_match_values_never_reach_the_task_log(self, monkeypatch: pytest.MonkeyPatch) -> None:
         respx.post(f"{BASE_URL}/people/filter").mock(return_value=httpx.Response(404))
+        operator = DreamhubBulkOperator(
+            task_id="load",
+            entity="people",
+            operation="update",
+            match_field="email",
+            records=[{"email": "dana.private@example.com", "title": "CFO"}],
+        )
+        # Spy on the operator's own logger: Airflow 3 does not route it through `logging`.
+        spy = MagicMock()
+        monkeypatch.setattr(type(operator), "log", property(lambda _self: spy))
 
-        with caplog.at_level(logging.INFO), pytest.raises(Exception, match="1 of 1 records failed"):
-            DreamhubBulkOperator(
-                task_id="load",
-                entity="people",
-                operation="update",
-                match_field="email",
-                records=[{"email": "dana.private@example.com", "title": "CFO"}],
-            ).execute({})
+        with pytest.raises(Exception, match="1 of 1 records failed"):
+            operator.execute({})
 
-        assert "dana.private@example.com" not in caplog.text
+        logged = str(spy.mock_calls)
+        assert "Failed records" in logged  # positive control: the failure was logged
+        assert "dana.private@example.com" not in logged
+
+    @respx.mock
+    def test_the_lookup_query_sends_the_cleaned_value(self) -> None:
+        lookup = respx.post(f"{BASE_URL}/companies/filter").mock(return_value=httpx.Response(404))
+
+        DreamhubBulkOperator(
+            task_id="load",
+            entity="companies",
+            operation="update",
+            match_field="account_number",
+            fail_on_partial=False,
+            records=[{"account_number": " 42 "}, {"account_number": 7.0}],
+        ).execute({})
+
+        assert json.loads(lookup.calls[0].request.content)["filters"] == {"account_number": ["42", 7]}
 
 
 class TestARunThatStopsPartWay:
@@ -217,15 +225,117 @@ class TestARunThatStopsPartWay:
                 task_id="load",
                 entity="companies",
                 operation="create",
-                records=[{"name": n} for n in "ABCD"],
+                records=[{"name": n} for n in "ABCDE"],
                 batch_size=2,
                 results_path=str(results),
             ).execute({})
 
         assert raised.value.result.succeeded_ids == ["c-1", "c-2"]
-        assert (raised.value.unknown_from, raised.value.unknown_to) == (2, 4)
+        assert (raised.value.unknown, raised.value.not_attempted) == ([2, 3], [4])
         written = json.loads(results.read_text(encoding="utf-8"))
         assert written["succeeded_ids"] == ["c-1", "c-2"]
+        assert (written["unknown_positions"], written["not_attempted_positions"]) == ([2, 3], [4])
+
+    @respx.mock
+    def test_positions_are_the_callers_own_after_matching(self, tmp_path: Path) -> None:
+        respx.post(f"{BASE_URL}/companies/filter").mock(
+            return_value=_page("companies", [{"id": "c-1", "accountNumber": "B"}, {"id": "c-2", "accountNumber": "C"}])
+        )
+        respx.put(f"{BASE_URL}/companies/bulk/update").mock(
+            side_effect=[httpx.Response(200, json={"successfulIds": ["c-1"], "errors": {}}), httpx.Response(504)]
+        )
+        results = tmp_path / "results.ndjson"
+
+        with pytest.raises(DreamhubBulkError) as raised:
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="update",
+                match_field="account_number",
+                batch_size=1,
+                results_path=str(results),
+                records=[{"account_number": "A"}, {"account_number": "B"}, {"account_number": "C"}],
+            ).execute({})
+
+        # Input 0 matched nothing, input 1 was written, input 2 was in flight.
+        assert raised.value.unknown == [2]
+        assert raised.value.result.failures == [{"key": 0, "error": "no record has this account_number value"}]
+        assert "1 records were written and 1 failed" in str(raised.value)
+
+    @respx.mock
+    def test_an_unexpected_response_still_keeps_the_partial_result(self, tmp_path: Path) -> None:
+        respx.post(f"{BASE_URL}/companies/bulk/create").mock(
+            side_effect=[
+                httpx.Response(201, json={"successfulIds": ["c-1"], "errors": {}}),
+                httpx.Response(200, text="<html>gateway</html>"),
+            ]
+        )
+        results = tmp_path / "results.ndjson"
+
+        with pytest.raises(DreamhubBulkError):
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="create",
+                records=[{"name": "A"}, {"name": "B"}],
+                batch_size=1,
+                results_path=str(results),
+            ).execute({})
+
+        assert json.loads(results.read_text(encoding="utf-8"))["succeeded_ids"] == ["c-1"]
+
+    def test_a_delete_on_a_connection_without_a_token_fails_instead_of_blaming_records(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AIRFLOW_CONN_DREAMHUB_NOTOKEN", json.dumps({"conn_type": "dreamhub", "host": BASE_URL}))
+        hook = DreamhubHook(dreamhub_conn_id="dreamhub_notoken")
+
+        with pytest.raises(DreamhubBulkError) as raised:
+            hook.bulk("tasks", "delete", [{"id": "t-1"}, {"id": "t-2"}])
+
+        assert isinstance(raised.value.cause, ValueError)
+        assert raised.value.result.failures == []
+
+    @respx.mock
+    def test_a_rejected_token_stops_a_delete(self, hook: DreamhubHook) -> None:
+        route = respx.delete(url__startswith=f"{BASE_URL}/tasks/").mock(return_value=httpx.Response(401))
+
+        with pytest.raises(DreamhubBulkError) as raised:
+            hook.bulk("tasks", "delete", [{"id": "t-1"}, {"id": "t-2"}])
+
+        assert route.call_count == 1
+        assert raised.value.not_attempted == [1]
+
+    def test_the_stop_error_survives_pickling(self) -> None:
+        error = DreamhubBulkError(BulkResult("create", ["c-1"]), [1], [2], DreamhubApiError("POST", "x", 504))
+
+        copy = pickle.loads(pickle.dumps(error))
+
+        assert (copy.unknown, copy.not_attempted, copy.result.succeeded_ids) == ([1], [2], ["c-1"])
+        assert copy.cause.status_code == 504
+
+
+class TestErrorKeysTheApiAlsoSends:
+    @respx.mock
+    def test_entity_keys_and_text_none_ids_are_handled_like_the_api(self, hook: DreamhubHook) -> None:
+        respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(
+            return_value=httpx.Response(
+                206,
+                json={
+                    "successfulIds": [],
+                    "failedIds": ["c-5"],
+                    "errors": {"create_entity_c-5": "custom field failed", "create_1": "name is required"},
+                },
+            )
+        )
+
+        result = hook.bulk("companies", "upsert", [{"id": "None", "name": "A"}, {"name": ""}], match_existing=False)
+
+        # "None" counts as no id, as the API treats it, so create_1 is input position 1.
+        assert result.failures == [
+            {"key": "c-5", "error": "custom field failed"},
+            {"key": 1, "error": "name is required"},
+        ]
 
 
 class TestRetries:
@@ -310,3 +420,46 @@ class TestLocalFiles:
 
         assert target.read_text(encoding="utf-8") == '{"id": "c-1"}\n'
         assert sorted(p.name for p in target.parent.iterdir()) == ["companies.ndjson"]
+
+    @respx.mock
+    def test_a_failed_read_leaves_no_staging_file(self, tmp_path: Path) -> None:
+        respx.post(f"{BASE_URL}/companies/filter").mock(
+            side_effect=[
+                httpx.Response(200, json={"companies": [{"id": "c-1"}, {"id": "c-2"}], "total": 3}),
+                httpx.Response(200, json={"companies": [], "total": 3}),
+            ]
+        )
+        target = tmp_path / "companies.ndjson"
+        target.write_text("previous\n", encoding="utf-8")
+
+        with pytest.raises(Exception, match="read 2 distinct records"):
+            DreamhubExtractOperator(
+                task_id="extract", entity="companies", output_path=str(target), page_size=2
+            ).execute({})
+
+        assert target.read_text(encoding="utf-8") == "previous\n"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["companies.ndjson"]
+
+    @respx.mock
+    def test_an_existing_files_permissions_are_kept(self, tmp_path: Path) -> None:
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_page("companies", [{"id": "c-1"}]))
+        target = tmp_path / "companies.ndjson"
+        target.write_text("old\n", encoding="utf-8")
+        os.chmod(target, 0o644)
+
+        DreamhubExtractOperator(task_id="extract", entity="companies", output_path=str(target)).execute({})
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+    @respx.mock
+    def test_a_symlinked_destination_is_written_through(self, tmp_path: Path) -> None:
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_page("companies", [{"id": "c-1"}]))
+        real = tmp_path / "real.ndjson"
+        real.write_text("old\n", encoding="utf-8")
+        link = tmp_path / "link.ndjson"
+        link.symlink_to(real)
+
+        DreamhubExtractOperator(task_id="extract", entity="companies", output_path=str(link)).execute({})
+
+        assert link.is_symlink()
+        assert real.read_text(encoding="utf-8") == '{"id": "c-1"}\n'

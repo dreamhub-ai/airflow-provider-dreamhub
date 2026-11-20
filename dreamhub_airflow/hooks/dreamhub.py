@@ -44,6 +44,9 @@ class DreamhubApiError(Exception):
         message = f"Dreamhub API {method} {path} failed with HTTP {status_code}"
         super().__init__(f"{message}: {detail}" if detail else message)
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (type(self), (self.method, self.path, self.status_code, self.detail))
+
 
 class DreamhubConsistencyError(Exception):
     """A paged read did not return exactly the rows the API said match, so the result is not trustworthy."""
@@ -86,19 +89,24 @@ class BulkResult:
 class DreamhubBulkError(Exception):
     """A bulk write stopped part-way. ``result`` holds what was written and what failed before it stopped.
 
-    The records of the batch that was in flight (``unknown_from`` to ``unknown_to``, input
-    positions, end exclusive) may or may not have been written.
+    ``unknown`` lists the input positions of the batch that was in flight: those records may or
+    may not have been written. ``not_attempted`` lists the input positions never sent.
     """
 
-    def __init__(self, result: BulkResult, unknown_from: int, unknown_to: int, cause: Exception) -> None:
+    def __init__(self, result: BulkResult, unknown: list[int], not_attempted: list[int], cause: BaseException) -> None:
         self.result = result
-        self.unknown_from = unknown_from
-        self.unknown_to = unknown_to
+        self.unknown = list(unknown)
+        self.not_attempted = list(not_attempted)
+        self.cause = cause
         super().__init__(
-            f"Dreamhub bulk {result.operation} stopped: {cause}. {result.succeeded} records were written and "
-            f"{result.failed} failed before it stopped; records {unknown_from} to {unknown_to - 1} may or may not "
-            "have been written"
+            f"Dreamhub bulk {result.operation} stopped ({type(cause).__name__}). Before it stopped "
+            f"{result.succeeded} records were written and {result.failed} failed; {len(self.unknown)} records "
+            f"(input positions {_span(self.unknown)}) may or may not have been written and "
+            f"{len(self.not_attempted)} were not attempted"
         )
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (type(self), (self.result, self.unknown, self.not_attempted, self.cause))
 
 
 class DreamhubHook(BaseHook):
@@ -271,7 +279,6 @@ class DreamhubHook(BaseHook):
         sort_field: str = "id",
         page_size: int = MAX_PAGE_SIZE,
         include_additionals: bool = False,
-        parent: tuple[str, str] | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Yield every record of ``entity`` matching ``filters``, one page at a time.
 
@@ -281,13 +288,12 @@ class DreamhubHook(BaseHook):
         data changed under the read and :class:`DreamhubConsistencyError` is raised, so a caller
         never loads a partial table believing it complete.
 
-        ``parent=("companies", "<id>")`` reads activities of one record (``entity`` must be
-        ``"activities"``); the API has no account-wide activity read yet. A parent record that
-        does not exist fails the read rather than reading as "no activities".
+        Activities cannot be read yet: the API has no read of activities by filter that is
+        scoped correctly, so ``entity="activities"`` is refused rather than returning wrong rows.
         """
         if not 1 <= page_size <= MAX_PAGE_SIZE:
             raise ValueError(f"page_size must be between 1 and {MAX_PAGE_SIZE}")
-        route = self._route(entity, parent)
+        route = self._route(entity)
         body: dict[str, Any] = {"filters": filters or {}, "sort": {"field": sort_field, "ascending": True}}
         params: dict[str, Any] = {"size": page_size}
         if include_additionals:
@@ -307,9 +313,6 @@ class DreamhubHook(BaseHook):
                 allow_not_found=True,
             )
             if response.status_code == 404:
-                if page == 1 and parent is not None:
-                    # For activities, a 404 says the parent record does not exist.
-                    raise DreamhubApiError("POST", f"{route.path}/filter", 404, _short_detail(response))
                 # The API answers "nothing matches" with 404. On a later page it only means
                 # there is nothing more; the count check below still catches a short read.
                 if page == 1:
@@ -370,7 +373,8 @@ class DreamhubHook(BaseHook):
         for value in values:
             key = self.match_key(value)
             if key is not None and key not in wanted:
-                wanted[key] = value
+                # Query with the cleaned value: the API compares what it is sent.
+                wanted[key] = _query_value(value)
         found: dict[str, list[str]] = {key: [] for key in wanted}
         keys = list(wanted)
         for start in range(0, len(keys), MAX_PAGE_SIZE):
@@ -385,8 +389,9 @@ class DreamhubHook(BaseHook):
     def match_key(value: Any) -> str | None:
         """The form two values of a match field are compared in, or None when the value cannot be matched.
 
-        Text is compared as written, apart from surrounding spaces; whole numbers compare equal
-        whatever their type (``"42"``, ``42`` and ``42.0``); booleans as ``true``/``false``.
+        Text is compared as written, apart from surrounding spaces; a whole number compares equal
+        to its plain text form (``42``, ``42.0`` and ``"42"``); ``true``/``false`` in any case
+        compare equal to booleans.
         An empty value, a list or an object has no key.
         """
         if value is None or isinstance(value, (list, dict, set)) or not isinstance(value, Hashable):
@@ -396,16 +401,16 @@ class DreamhubHook(BaseHook):
         if isinstance(value, float) and value.is_integer():
             return str(int(value))
         text = str(value).strip()
+        if text.lower() in ("true", "false"):
+            return text.lower()
         return text or None
 
     @staticmethod
-    def _route(entity: str, parent: tuple[str, str] | None) -> EntityRoute:
-        if parent is not None:
-            if entity != "activities":
-                raise ValueError("parent is only supported for entity='activities'")
-            return EntityRoute.activities_of(*parent)
-        if entity == "activities":
-            raise ValueError("activities are read per parent record: pass parent=('companies', '<id>')")
+    def _route(entity: str) -> EntityRoute:
+        if entity.strip("/").split("/")[-1] == "activities":
+            raise ValueError(
+                "activities cannot be read yet: the API has no correctly scoped read of activities by filter"
+            )
         return EntityRoute.for_entity(entity)
 
     # ------------------------------------------------------------------ writes
@@ -428,8 +433,9 @@ class DreamhubHook(BaseHook):
         an ``id`` and soft-deletes them one request at a time (the API has no bulk delete
         yet; ``batch_size`` and ``override`` do not apply).
 
-        A batch is never resent after an error the server may already have applied. If a batch
-        fails that way, :class:`DreamhubBulkError` is raised carrying everything reported so far.
+        A batch is never resent after an error the server may already have applied. If the run
+        stops for any reason, :class:`DreamhubBulkError` is raised carrying everything reported so
+        far, the positions whose outcome is unknown and those never attempted.
         """
         if operation not in BULK_OPERATIONS:
             raise ValueError(f"operation must be one of {', '.join(BULK_OPERATIONS)}")
@@ -446,8 +452,11 @@ class DreamhubHook(BaseHook):
                 self._write_batch(
                     route, operation, batch, start, result, override=override, match_existing=match_existing
                 )
-            except (DreamhubApiError, httpx.HTTPError) as error:
-                raise DreamhubBulkError(result, start, start + len(batch), error) from error
+            except Exception as error:
+                end = start + len(batch)
+                raise DreamhubBulkError(
+                    result, list(range(start, end)), list(range(end, len(records))), error
+                ) from error
         return result
 
     def _write_batch(
@@ -463,7 +472,7 @@ class DreamhubHook(BaseHook):
     ) -> None:
         if operation == "update":
             # The API skips update items without an id without reporting them; report them here.
-            missing = {i for i, record in enumerate(batch) if not record.get("id")}
+            missing = {i for i, record in enumerate(batch) if not _has_id(record)}
             for i in sorted(missing):
                 result.failures.append({"key": offset + i, "error": "record has no id"})
             positions = [i for i in range(len(batch)) if i not in missing]
@@ -502,31 +511,38 @@ class DreamhubHook(BaseHook):
 
     def _delete_each(self, route: EntityRoute, records: Sequence[dict[str, Any]], result: BulkResult) -> None:
         for position, record in enumerate(records):
-            record_id = record.get("id")
-            if not record_id:
+            if not _has_id(record):
                 result.failures.append({"key": position, "error": "record has no id"})
                 continue
+            record_id = str(record["id"])
             try:
-                self.request("DELETE", f"{route.path}/{quote(str(record_id), safe='')}")
+                path = _relative_path(f"{route.path}/{quote(record_id, safe='')}")
             except ValueError:
-                result.failures.append({"key": str(record_id), "error": "record id is not a valid id"})
+                result.failures.append({"key": record_id, "error": "record id is not a valid id"})
                 continue
+            try:
+                self.request("DELETE", path)
             except DreamhubApiError as error:
-                result.failures.append({"key": str(record_id), "error": error.detail or f"HTTP {error.status_code}"})
+                if error.status_code in (401, 403):
+                    # The credential, not the record: stop rather than fail every record the same way.
+                    raise DreamhubBulkError(
+                        result, [position], list(range(position + 1, len(records))), error
+                    ) from error
+                result.failures.append({"key": record_id, "error": error.detail or f"HTTP {error.status_code}"})
                 continue
-            except httpx.HTTPError as error:
-                raise DreamhubBulkError(result, position, position + 1, error) from error
-            result.succeeded_ids.append(str(record_id))
+            except Exception as error:
+                raise DreamhubBulkError(result, [position], list(range(position + 1, len(records))), error) from error
+            result.succeeded_ids.append(record_id)
 
 
 class _BatchKeys:
     """Turns the API's error keys for one batch into keys the caller can find in its own input.
 
-    The API keys an error by record id, by the record's position in the list it was sent, and,
-    for upsert, as ``update_<id>`` or ``create_<n>`` where ``n`` counts only the records it
-    created. The list sent can be shorter than the caller's batch (update records without an id
-    are held back), so a position is mapped back to the record's id when it has one, else to
-    its input position.
+    The API keys an error by record id, by the record's position in the list it was sent,
+    as ``entity_<id>``, and, for upsert, as ``update_<id>`` or ``create_<n>`` where ``n`` counts
+    only the records it created. The list sent can be shorter than the caller's batch (update
+    records without an id are held back), so a position is mapped back to the record's id when
+    it has one, else to its input position.
     """
 
     def __init__(self, sent: list[dict[str, Any]], positions: list[int], offset: int, *, server_matched: bool) -> None:
@@ -536,17 +552,21 @@ class _BatchKeys:
         # With match_existing the API may turn some id-less records into updates before
         # creating the rest, so ``create_<n>`` cannot be traced to one input record.
         self.server_matched = server_matched
-        self.new_records = [i for i, record in enumerate(sent) if not record.get("id")]
+        self.new_records = [i for i, record in enumerate(sent) if not _has_id(record)]
+        self.sent_ids = {str(record["id"]) for record in sent if _has_id(record)}
 
     def resolve(self, key: str) -> Any:
-        if key.startswith("update_"):
-            return key[len("update_") :]
+        for prefix in ("update_", "create_entity_", "entity_"):
+            if key.startswith(prefix):
+                return key[len(prefix) :]
+        if key in self.sent_ids:
+            return key
         if key.startswith("create_"):
             number = key[len("create_") :]
             if not number.isdigit():
                 return key
             if self.server_matched or int(number) >= len(self.new_records):
-                return f"new record {number} of the batch starting at {self.offset}"
+                return new_record_key(int(number), self.offset)
             return self._at(self.new_records[int(number)])
         if key.isdigit() and int(key) < len(self.sent):
             return self._at(int(key))
@@ -556,17 +576,55 @@ class _BatchKeys:
         return _record_key(self.sent[index], self.offset + self.positions[index])
 
 
+NEW_RECORD_KEY = "new record {number} of the batch starting at {position}"
+
+
+def new_record_key(number: int, position: int) -> str:
+    """The failure key of a new record the API could not create and that cannot be traced to one input."""
+    return NEW_RECORD_KEY.format(number=number, position=position)
+
+
+def _has_id(record: dict[str, Any]) -> bool:
+    """Whether the API treats the record as naming an existing one (it ignores ``None``, blank and ``"None"``)."""
+    value = record.get("id")
+    return value is not None and str(value).strip() not in ("", "None")
+
+
+def _query_value(value: Any) -> Any:
+    """The form a match value is sent in: text without surrounding spaces, whole floats as ints."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _span(positions: list[int]) -> str:
+    if not positions:
+        return "none"
+    if positions == list(range(positions[0], positions[-1] + 1)):
+        return f"{positions[0]} to {positions[-1]}"
+    return ", ".join(str(p) for p in positions[:20]) + (", ..." if len(positions) > 20 else "")
+
+
 def _record_key(record: dict[str, Any], position: int) -> Any:
     """A failure key: the record's Dreamhub id as text when it has one, else its input position."""
-    record_id = record.get("id")
-    return str(record_id) if record_id else position
+    return str(record["id"]) if _has_id(record) else position
 
 
 def _relative_path(path: str) -> str:
     """``path`` as a path under the API base URL, refusing anything that would leave it."""
     relative = path.lstrip("/")
     parts = urlsplit(relative)
-    if parts.scheme or parts.netloc or "\\" in relative:
+    if (
+        parts.scheme
+        or parts.netloc
+        or parts.query
+        or parts.fragment
+        or "?" in relative
+        or "#" in relative
+        or "\\" in relative
+    ):
         raise ValueError(f"path must be relative to the API base URL: {path!r}")
     if any(segment in (".", "..") for segment in parts.path.split("/")):
         raise ValueError(f"path must not contain '.' or '..' segments: {path!r}")

@@ -6,6 +6,7 @@ import contextlib
 import csv
 import json
 import os
+import stat
 import tempfile
 from collections.abc import Iterable, Iterator, Sequence
 from typing import Any, TextIO
@@ -54,12 +55,16 @@ class RecordFile:
     def _write_local(
         self, target: str, records: Iterable[dict[str, Any]], fields: Sequence[str] | None, neutralize_formulas: bool
     ) -> int:
-        directory = os.path.dirname(os.path.abspath(target))
+        # Write through a symlink to the file it names, and keep that file's permissions.
+        target = os.path.realpath(target)
+        directory = os.path.dirname(target)
         os.makedirs(directory, exist_ok=True)
+        mode = _mode_for(target)
         handle, staged = tempfile.mkstemp(dir=directory, prefix=".dreamhub-", suffix=".partial")
         try:
             with os.fdopen(handle, "w", encoding="utf-8", newline="") as staged_file:
                 count = self._write_records(staged_file, records, fields, neutralize_formulas)
+            os.chmod(staged, mode)
             os.replace(staged, target)
         except BaseException:
             with contextlib.suppress(FileNotFoundError):
@@ -126,6 +131,16 @@ class RecordFile:
             writer.writerow([_cell(record.get(c), neutralize_formulas) for c in columns])
             count += 1
         return count
+
+
+def _mode_for(target: str) -> int:
+    """The permissions the published file gets: the existing file's, else the usual default for a new file."""
+    try:
+        return stat.S_IMODE(os.stat(target).st_mode)
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        return 0o666 & ~umask
 
 
 def _local_path(path: str) -> str | None:
