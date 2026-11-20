@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  # The release workflow runs these checks on the tagged commit before publishing.
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - run: pip install "ruff>=0.6"
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    name: Tests (Airflow ${{ matrix.airflow }}, Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { airflow: "2.9.3", python: "3.10" }
+          - { airflow: "2.9.3", python: "3.11" }
+          - { airflow: "2.10.5", python: "3.11" }
+          - { airflow: "3.3.2", python: "3.12" }
+          - { airflow: "3.4.0", python: "3.12" }
+    env:
+      CONSTRAINTS: https://raw.githubusercontent.com/apache/airflow/constraints-${{ matrix.airflow }}/constraints-${{ matrix.python }}.txt
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install Airflow with its constraints
+        run: pip install "apache-airflow==${{ matrix.airflow }}" --constraint "$CONSTRAINTS"
+      - name: Install the provider within the same constraints
+        run: pip install -e ".[test]" --constraint "$CONSTRAINTS"
+      - name: Run tests
+        run: pytest --cov --cov-report=term --cov-fail-under=80
+
+  tests-passed:
+    # One stable check name for branch protection: the matrix rows above change as Airflow
+    # versions move, this job's name does not.
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: test
+    if: always()
+    steps:
+      - name: Every Airflow version passed
+        run: test "${{ needs.test.result }}" = "success"
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - run: pip install "build>=1.2" "twine>=5"
+      - run: python -m build
+      - run: twine check dist/*
+
+  e2e:
+    name: End-to-end (Dreamhub test environment)
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    # Only on main: these steps can read the test-environment secrets.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+    env:
+      DREAMHUB_E2E_URL: ${{ secrets.DREAMHUB_E2E_URL }}
+      DREAMHUB_E2E_TOKEN: ${{ secrets.DREAMHUB_E2E_TOKEN }}
+      CONSTRAINTS: https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.12.txt
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install Airflow with its constraints
+        run: pip install "apache-airflow==3.3.2" --constraint "$CONSTRAINTS"
+      - run: pip install -e ".[test]" --constraint "$CONSTRAINTS"
+      - name: Run end-to-end tests
+        if: env.DREAMHUB_E2E_TOKEN != ''
+        run: pytest -m e2e -v
