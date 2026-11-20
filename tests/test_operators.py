@@ -174,7 +174,9 @@ class TestBulk:
 
     @respx.mock
     def test_upsert_creates_records_no_match_was_found_for(self):
-        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=httpx.Response(404))
+        respx.post(f"{BASE_URL}/companies/filter").mock(
+            return_value=httpx.Response(404, json={"detail": "No companies found"})
+        )
         upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(
             return_value=httpx.Response(200, json={"successfulIds": ["c-9"], "errors": {}})
         )

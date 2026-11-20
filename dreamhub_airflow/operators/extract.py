@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any
 
-from dreamhub_airflow._compat import BaseOperator
+from dreamhub_airflow._compat import BaseOperator, Context
 from dreamhub_airflow.files import RecordFile
 from dreamhub_airflow.hooks.dreamhub import MAX_PAGE_SIZE, DreamhubHook
+from dreamhub_airflow.records import Record
 
 
 class DreamhubExtractOperator(BaseOperator):
@@ -28,7 +29,7 @@ class DreamhubExtractOperator(BaseOperator):
         with ``'`` (default). Set False when loading the file into a warehouse.
     """
 
-    template_fields: Sequence[str] = ("entity", "output_path", "filters")
+    template_fields: Collection[str] = ("entity", "output_path", "filters")
     template_fields_renderers = {"filters": "json"}
     ui_color = "#e8f4fd"
 
@@ -37,7 +38,7 @@ class DreamhubExtractOperator(BaseOperator):
         *,
         entity: str,
         output_path: str,
-        filters: dict[str, Any] | None = None,
+        filters: Record | None = None,
         file_format: str = "ndjson",
         fields: Sequence[str] | None = None,
         include_additionals: bool = False,
@@ -45,6 +46,8 @@ class DreamhubExtractOperator(BaseOperator):
         neutralize_formulas: bool = True,
         dreamhub_conn_id: str = DreamhubHook.default_conn_name,
         storage_conn_id: str | None = None,
+        # Airflow's own operator arguments (task_id, retries, ...), forwarded unchanged: they are
+        # BaseOperator's to type, and this is the one place `Any` remains.
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -59,7 +62,7 @@ class DreamhubExtractOperator(BaseOperator):
         self.dreamhub_conn_id = dreamhub_conn_id
         self.storage_conn_id = storage_conn_id
 
-    def execute(self, context: Any) -> dict[str, Any]:
+    def execute(self, context: Context) -> Record:
         hook = DreamhubHook(dreamhub_conn_id=self.dreamhub_conn_id)
         records = hook.iter_records(
             self.entity,

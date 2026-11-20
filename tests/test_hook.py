@@ -72,7 +72,7 @@ class TestReading:
 
     @respx.mock
     def test_no_match_is_an_empty_read_not_an_error(self, hook):
-        respx.post(f"{BASE_URL}/leads/filter").mock(return_value=httpx.Response(404, json={"detail": "Not found"}))
+        respx.post(f"{BASE_URL}/leads/filter").mock(return_value=httpx.Response(404, json={"detail": "No leads found"}))
 
         assert hook.get_records("leads", {"status": 99}) == []
 

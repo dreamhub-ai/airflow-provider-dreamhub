@@ -175,7 +175,9 @@ class TestMatching:
 
     @respx.mock
     def test_match_values_never_reach_the_task_log(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        respx.post(f"{BASE_URL}/people/filter").mock(return_value=httpx.Response(404))
+        respx.post(f"{BASE_URL}/people/filter").mock(
+            return_value=httpx.Response(404, json={"detail": "No people found"})
+        )
         operator = DreamhubBulkOperator(
             task_id="load",
             entity="people",
@@ -196,7 +198,9 @@ class TestMatching:
 
     @respx.mock
     def test_the_lookup_query_sends_the_cleaned_value(self) -> None:
-        lookup = respx.post(f"{BASE_URL}/companies/filter").mock(return_value=httpx.Response(404))
+        lookup = respx.post(f"{BASE_URL}/companies/filter").mock(
+            return_value=httpx.Response(404, json={"detail": "No companies found"})
+        )
 
         DreamhubBulkOperator(
             task_id="load",

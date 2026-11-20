@@ -18,6 +18,7 @@ import httpx
 from dreamhub_airflow import __version__
 from dreamhub_airflow._compat import BaseHook
 from dreamhub_airflow.entities import EntityRoute
+from dreamhub_airflow.records import JsonValue, QueryParams, Record
 
 DEFAULT_BASE_URL = "https://crm.dreamhub.ai/api/v1"
 # The API refuses larger pages.
@@ -31,8 +32,9 @@ DEFAULT_MAX_RETRY_WAIT_SECONDS = 300.0
 # Longest wait between retries of a gateway error or a dropped connection.
 MAX_BACKOFF_SECONDS = 60.0
 RETRYABLE_STATUSES = frozenset({502, 503, 504})
-# The API's answer for a path it does not serve, as opposed to "No <entity> found".
-_UNKNOWN_ROUTE_DETAIL = "Not Found"
+# The API's answer when nothing matches a filter. Any other 404 (a path it does not serve, or a
+# proxy's page) is an error, not an empty result.
+_NOTHING_MATCHES = re.compile(r"No .+ found")
 # Longest error text kept from one API answer.
 MAX_DETAIL_CHARS = 200
 BULK_OPERATIONS = ("create", "update", "upsert", "delete")
@@ -67,7 +69,7 @@ class DreamhubApiError(Exception):
         message = f"Dreamhub API {method} {path} failed with HTTP {status_code}"
         super().__init__(f"{message} ({summary})" if summary else message)
 
-    def __reduce__(self) -> tuple[Any, ...]:
+    def __reduce__(self) -> tuple[object, ...]:
         return (
             type(self),
             (self.method, self.path, self.status_code, self.detail, self.item_errors, self.summary),
@@ -94,10 +96,10 @@ class BulkResult:
 
     operation: str
     succeeded_ids: list[str] = field(default_factory=list)
-    failures: list[dict[str, Any]] = field(default_factory=list)
+    failures: list[Record] = field(default_factory=list)
 
     @staticmethod
-    def record_key(record: dict[str, Any], position: int) -> Any:
+    def record_key(record: Record, position: int) -> str | int:
         """A failure key: the record's Dreamhub id as text when it has one, else its input position."""
         return str(record["id"]) if DreamhubHook._has_id(record) else position
 
@@ -107,7 +109,7 @@ class BulkResult:
         return cls.NEW_RECORD_KEY.format(number=number, position=position)
 
     @staticmethod
-    def parse_new_record_key(key: Any) -> tuple[int, int] | None:
+    def parse_new_record_key(key: object) -> tuple[int, int] | None:
         """``(number, position)`` from a key made by :meth:`new_record_key`, else None."""
         found = _NEW_RECORD_PATTERN.fullmatch(key) if isinstance(key, str) else None
         return (int(found["number"]), int(found["position"])) if found else None
@@ -120,7 +122,7 @@ class BulkResult:
     def failed(self) -> int:
         return len(self.failures)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> Record:
         return {
             "operation": self.operation,
             "succeeded": self.succeeded,
@@ -149,7 +151,7 @@ class DreamhubBulkError(Exception):
             f"{_count_with_positions(self.not_attempted)} were not attempted"
         )
 
-    def __reduce__(self) -> tuple[Any, ...]:
+    def __reduce__(self) -> tuple[object, ...]:
         return (type(self), (self.result, self.unknown, self.not_attempted, self.cause))
 
     def propagate(self) -> NoReturn:
@@ -177,6 +179,7 @@ class DreamhubHook(BaseHook):
     conn_type = "dreamhub"
     hook_name = "Dreamhub"
 
+    # Airflow's own hook arguments are forwarded unchanged; they are BaseHook's to type.
     def __init__(self, dreamhub_conn_id: str = default_conn_name, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.dreamhub_conn_id = dreamhub_conn_id
@@ -186,7 +189,7 @@ class DreamhubHook(BaseHook):
         self._sleep = time.sleep
 
     @classmethod
-    def get_ui_field_behaviour(cls) -> dict[str, Any]:
+    def get_ui_field_behaviour(cls) -> Record:
         return {
             "hidden_fields": ["schema", "port", "login"],
             "relabeling": {"host": "API base URL", "password": "API token"},
@@ -230,7 +233,7 @@ class DreamhubHook(BaseHook):
 
     def test_connection(self) -> tuple[bool, str]:
         try:
-            self.request(
+            response = self.request(
                 "POST",
                 "companies/filter",
                 params={"page": 1, "size": 1},
@@ -242,6 +245,8 @@ class DreamhubHook(BaseHook):
             return False, str(error)
         finally:
             self.close()
+        if response.status_code == 404 and not _NOTHING_MATCHES.fullmatch(_ErrorBody.read(response).detail or ""):
+            return False, "The API base URL does not serve the Dreamhub API"
         return True, "Connection to Dreamhub succeeded"
 
     # ------------------------------------------------------------------ HTTP
@@ -251,8 +256,8 @@ class DreamhubHook(BaseHook):
         method: str,
         path: str,
         *,
-        params: dict[str, Any] | None = None,
-        json: Any = None,
+        params: QueryParams | None = None,
+        json: object = None,
         retry: bool = False,
         allow_not_found: bool = False,
     ) -> httpx.Response:
@@ -295,7 +300,8 @@ class DreamhubHook(BaseHook):
             if status >= 300:
                 # Redirects are not followed (the token stays with the configured API), so an
                 # answer that is not a success is an error, a redirect included.
-                raise DreamhubApiError(method, url, status, **_ErrorBody.read(response).as_error_fields())
+                body = _ErrorBody.read(response)
+                raise DreamhubApiError(method, url, status, body.detail, body.item_errors, body.summary)
             return response
 
     def _wait(self, seconds: float, method: str, path: str, reason: str) -> None:
@@ -331,12 +337,12 @@ class DreamhubHook(BaseHook):
     def iter_records(
         self,
         entity: str,
-        filters: dict[str, Any] | None = None,
+        filters: Record | None = None,
         *,
         sort_field: str = "id",
         page_size: int = MAX_PAGE_SIZE,
         include_additionals: bool = False,
-    ) -> Iterator[dict[str, Any]]:
+    ) -> Iterator[Record]:
         """Yield every record of ``entity`` matching ``filters``, one page at a time.
 
         Pages are ordered by ``sort_field`` (``id`` by default, which is unique and stable).
@@ -351,8 +357,8 @@ class DreamhubHook(BaseHook):
         if not 1 <= page_size <= MAX_PAGE_SIZE:
             raise ValueError(f"page_size must be between 1 and {MAX_PAGE_SIZE}")
         route = self._route(entity)
-        body: dict[str, Any] = {"filters": filters or {}, "sort": {"field": sort_field, "ascending": True}}
-        params: dict[str, Any] = {"size": page_size}
+        body: Record = {"filters": filters or {}, "sort": {"field": sort_field, "ascending": True}}
+        params: QueryParams = {"size": page_size}
         if include_additionals:
             params["include_additionals"] = "true"
 
@@ -374,7 +380,7 @@ class DreamhubHook(BaseHook):
                 # The API answers "nothing matches" with 404. On a later page it only means
                 # there is nothing more; the count check below still catches a short read. A 404
                 # for a path the API does not serve at all is a wrong entity, not an empty result.
-                if _ErrorBody.read(response).detail == _UNKNOWN_ROUTE_DETAIL:
+                if not _NOTHING_MATCHES.fullmatch(_ErrorBody.read(response).detail or ""):
                     raise DreamhubApiError("POST", f"{route.path}/filter", 404, summary="no such route")
                 if page == 1:
                     totals.add(0)
@@ -423,11 +429,27 @@ class DreamhubHook(BaseHook):
                 "run the task again"
             )
 
-    def get_records(self, entity: str, filters: dict[str, Any] | None = None, **kwargs: Any) -> list[dict[str, Any]]:
+    def get_records(
+        self,
+        entity: str,
+        filters: Record | None = None,
+        *,
+        sort_field: str = "id",
+        page_size: int = MAX_PAGE_SIZE,
+        include_additionals: bool = False,
+    ) -> list[Record]:
         """All matching records in memory. Prefer :meth:`iter_records` for large reads."""
-        return list(self.iter_records(entity, filters, **kwargs))
+        return list(
+            self.iter_records(
+                entity,
+                filters,
+                sort_field=sort_field,
+                page_size=page_size,
+                include_additionals=include_additionals,
+            )
+        )
 
-    def resolve_ids(self, entity: str, match_field: str, values: Iterable[Any]) -> dict[str, list[str]]:
+    def resolve_ids(self, entity: str, match_field: str, values: Iterable[JsonValue]) -> dict[str, list[str]]:
         """Map each value of ``match_field`` to the ids of the records holding it.
 
         Works for any field the API can filter on, custom fields included. The result is keyed
@@ -436,7 +458,7 @@ class DreamhubHook(BaseHook):
         several records hold maps to all their ids. Values with no key (empty, or a list) are
         left out.
         """
-        wanted: dict[str, Any] = {}
+        wanted: Record = {}
         for value in values:
             key = self.match_key(value)
             if key is not None and key not in wanted:
@@ -453,7 +475,7 @@ class DreamhubHook(BaseHook):
         return found
 
     @staticmethod
-    def match_key(value: Any) -> str | None:
+    def match_key(value: object) -> str | None:
         """The form two values of a match field are compared in, or None when the value cannot be matched.
 
         Text is compared as written, apart from surrounding spaces; a whole number compares equal
@@ -473,7 +495,7 @@ class DreamhubHook(BaseHook):
         return text or None
 
     @staticmethod
-    def _has_id(record: dict[str, Any]) -> bool:
+    def _has_id(record: Record) -> bool:
         """Whether the API treats the record as naming an existing one: the same test the API applies
         (an empty or false value, ``"None"`` and blank text name no record)."""
         value = record.get("id")
@@ -498,7 +520,7 @@ class DreamhubHook(BaseHook):
         self,
         entity: str,
         operation: str,
-        records: Sequence[dict[str, Any]],
+        records: Sequence[Record],
         *,
         batch_size: int = DEFAULT_BULK_BATCH,
         override: bool = False,
@@ -537,8 +559,9 @@ class DreamhubHook(BaseHook):
                 )
             except BaseException as error:
                 end = start + len(batch)
-                unknown = getattr(error, "positions", None)
-                if unknown is None:
+                if isinstance(error, _UnreportedRecords):
+                    unknown = error.positions
+                else:
                     # Records held back before sending already have their outcome reported.
                     reported = {f["key"] for f in result.failures if isinstance(f["key"], int)}
                     unknown = [p for p in range(start, end) if p not in reported]
@@ -549,7 +572,7 @@ class DreamhubHook(BaseHook):
         self,
         route: EntityRoute,
         operation: str,
-        batch: list[dict[str, Any]],
+        batch: list[Record],
         offset: int,
         result: BulkResult,
         *,
@@ -613,24 +636,29 @@ class DreamhubHook(BaseHook):
 
     @staticmethod
     def _check_every_record_reported(
-        payload: dict[str, Any],
-        sent: list[dict[str, Any]],
+        payload: Record,
+        sent: list[Record],
         positions: list[int],
         offset: int,
         reported: set[str],
         result: BulkResult,
     ) -> None:
         """A record the response neither confirms nor reports as failed has an unknown outcome."""
-        succeeded = {str(i) for i in payload.get("successfulIds") or []}
-        if len(succeeded) + len(reported) >= len(sent):
+        listed = payload.get("successfulIds")
+        listed = listed if isinstance(listed, list) else []
+        # The raw count, not the distinct ids: a response may name one stored record for two inputs.
+        if len(listed) + len(reported) >= len(sent):
             return
+        succeeded = {str(i) for i in listed}
         unknown: list[int] = []
         for position, record in zip(positions, sent, strict=True):
             key = str(BulkResult.record_key(record, offset + position))
             if key in succeeded or key in reported:
                 continue
             if DreamhubHook._has_id(record):
-                result.failures.append({"key": key, "error": "not reported by Dreamhub"})
+                result.failures.append(
+                    {"key": key, "error": "outcome not reported by Dreamhub; it may have been written"}
+                )
             else:
                 unknown.append(offset + position)
         # A new record's id is only known once it exists, so how many of the unreported new records
@@ -638,7 +666,7 @@ class DreamhubHook(BaseHook):
         if unknown:
             raise _UnreportedRecords(unknown)
 
-    def _delete_each(self, route: EntityRoute, records: Sequence[dict[str, Any]], result: BulkResult) -> None:
+    def _delete_each(self, route: EntityRoute, records: Sequence[Record], result: BulkResult) -> None:
         for position, record in enumerate(records):
             key = BulkResult.record_key(record, position)
             if not self._has_id(record):
@@ -650,10 +678,11 @@ class DreamhubHook(BaseHook):
                 result.failures.append({"key": key, "error": "record id is not a valid id"})
                 continue
             try:
-                self.request("DELETE", path)
+                # A delete of a record already deleted succeeds, so resending after a gateway error is safe.
+                self.request("DELETE", path, retry=True)
             except DreamhubApiError as error:
                 if error.status_code in RETRYABLE_STATUSES:
-                    # A gateway error does not say whether the delete was applied.
+                    # Still failing after the retries: whether the delete was applied is unknown.
                     DreamhubBulkError(result, [position], list(range(position + 1, len(records))), error).propagate()
                 if error.status_code == 401:
                     # The token was refused: every later record would fail the same way.
@@ -663,7 +692,7 @@ class DreamhubHook(BaseHook):
                 continue
             except BaseException as error:
                 DreamhubBulkError(result, [position], list(range(position + 1, len(records))), error).propagate()
-            result.succeeded_ids.append(key)
+            result.succeeded_ids.append(str(key))
 
 
 class _UnreportedRecords(Exception):
@@ -672,6 +701,9 @@ class _UnreportedRecords(Exception):
     def __init__(self, positions: list[int]) -> None:
         super().__init__(f"{len(positions)} new records were neither confirmed nor reported as failed")
         self.positions = positions
+
+    def __reduce__(self) -> tuple[object, ...]:
+        return (type(self), (self.positions,))
 
 
 class _BatchKeys:
@@ -684,7 +716,7 @@ class _BatchKeys:
     it has one, else to its input position.
     """
 
-    def __init__(self, sent: list[dict[str, Any]], positions: list[int], offset: int, *, server_matched: bool) -> None:
+    def __init__(self, sent: list[Record], positions: list[int], offset: int, *, server_matched: bool) -> None:
         self.sent = sent
         self.positions = positions
         self.offset = offset
@@ -694,7 +726,7 @@ class _BatchKeys:
         self.new_records = [i for i, record in enumerate(sent) if not DreamhubHook._has_id(record)]
         self.sent_ids = {str(record["id"]) for record in sent if DreamhubHook._has_id(record)}
 
-    def resolve(self, key: str) -> Any:
+    def resolve(self, key: str) -> JsonValue:
         for prefix in ("update_", "create_entity_", "entity_"):
             if key.startswith(prefix):
                 return key[len(prefix) :]
@@ -711,7 +743,7 @@ class _BatchKeys:
             return self._at(int(key))
         return key
 
-    def _at(self, index: int) -> Any:
+    def _at(self, index: int) -> JsonValue:
         return BulkResult.record_key(self.sent[index], self.offset + self.positions[index])
 
 
@@ -723,13 +755,13 @@ _NEW_RECORD_PATTERN = re.compile(
 )
 
 
-def _query_value(value: Any) -> Any:
+def _query_value(value: object) -> JsonValue:
     """The form a match value is sent in: text without surrounding spaces, whole floats as ints."""
     if isinstance(value, str):
         return value.strip()
     if isinstance(value, float) and value.is_integer():
         return int(value)
-    return value
+    return value if isinstance(value, (int, float, bool)) else str(value)
 
 
 def _count_with_positions(positions: list[int]) -> str:
@@ -765,13 +797,15 @@ def _flag(value: bool) -> str:
     return "true" if value else "false"
 
 
-def _rows(payload: Any, items_key: str) -> list[dict[str, Any]]:
+def _rows(payload: JsonValue, items_key: str) -> list[Record]:
+    # A row that is not an object is dropped; the count check then reports the short read.
     if isinstance(payload, list):
-        return payload
-    for key in (items_key, _camel(items_key), "items"):
-        rows = payload.get(key)
-        if isinstance(rows, list):
-            return rows
+        return [row for row in payload if isinstance(row, dict)]
+    if isinstance(payload, dict):
+        for key in (items_key, _camel(items_key), "items"):
+            rows = payload.get(key)
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
     raise DreamhubApiError(
         "POST", items_key, 200, "response has no list of records", summary="response has no list of records"
     )
@@ -782,7 +816,7 @@ def _camel(name: str) -> str:
     return head + "".join(part.title() for part in rest)
 
 
-def _field_value(row: dict[str, Any], name: str) -> Any:
+def _field_value(row: Record, name: str) -> JsonValue:
     if name in row:
         return row[name]
     camel = _camel(name)
@@ -809,7 +843,7 @@ class _ValidationEntry:
     _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
     @classmethod
-    def parse(cls, entry: Any) -> _ValidationEntry | None:
+    def parse(cls, entry: object) -> _ValidationEntry | None:
         """The entry, or ``None`` when it is not shaped like a validation error.
 
         The entry's ``input`` holds the rejected value and is never read. ``reason`` names the
@@ -836,7 +870,7 @@ class _ValidationEntry:
         )
 
     @classmethod
-    def _safe_part(cls, part: Any) -> str:
+    def _safe_part(cls, part: object) -> str:
         if isinstance(part, int) and not isinstance(part, bool):
             return str(part)
         return part if isinstance(part, str) and cls._NAME.fullmatch(part) else "?"
@@ -871,9 +905,6 @@ class _ErrorBody:
             item_errors={item: _joined(reasons) or "" for item, reasons in by_item.items()},
             summary=_joined(entry.summary for entry in entries),
         )
-
-    def as_error_fields(self) -> dict[str, Any]:
-        return {"detail": self.detail, "item_errors": self.item_errors, "summary": self.summary}
 
 
 def _joined(texts: Iterable[str]) -> str | None:

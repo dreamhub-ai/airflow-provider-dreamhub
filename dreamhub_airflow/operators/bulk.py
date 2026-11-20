@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Collection
 from typing import Any
 
-from dreamhub_airflow._compat import BaseOperator
+from dreamhub_airflow._compat import BaseOperator, Context
 from dreamhub_airflow.files import FILE_FORMATS, RecordFile
 from dreamhub_airflow.hooks.dreamhub import (
     BULK_OPERATIONS,
@@ -16,6 +16,7 @@ from dreamhub_airflow.hooks.dreamhub import (
     DreamhubBulkError,
     DreamhubHook,
 )
+from dreamhub_airflow.records import JsonValue, Record
 
 # XCom is for small values: the task returns samples, and ``results_path`` holds everything.
 MAX_FAILURES_IN_XCOM = 100
@@ -25,16 +26,16 @@ MAX_IDS_IN_XCOM = 1000
 class DreamhubRecordsFailedError(Exception):
     """Some records were not written and the operator was asked to fail on that.
 
-    ``summary`` is the task's full result (every failure and its reason, in input positions), the
-    value the task would have returned. The reasons are Dreamhub's own messages, so they are kept
-    off the message, which ends up in the task log.
+    ``summary`` is the task's full result (every failure and its reason, keyed by the record's id, or
+    by its input position when it has none), the value the task would have returned. The reasons
+    are Dreamhub's own messages, so they are kept off the message, which ends up in the task log.
     """
 
-    def __init__(self, message: str, summary: dict[str, Any] | None = None) -> None:
+    def __init__(self, message: str, summary: Record | None = None) -> None:
         super().__init__(message)
         self.summary = summary or {}
 
-    def __reduce__(self) -> tuple[Any, ...]:
+    def __reduce__(self) -> tuple[object, ...]:
         return (type(self), (str(self), self.summary))
 
 
@@ -71,7 +72,7 @@ class DreamhubBulkOperator(BaseOperator):
     them again; for loads that may be retried, use ``upsert`` with ``match_field``.
     """
 
-    template_fields: Sequence[str] = ("entity", "records", "input_path", "results_path")
+    template_fields: Collection[str] = ("entity", "records", "input_path", "results_path")
     ui_color = "#fdf2e8"
 
     def __init__(
@@ -79,7 +80,7 @@ class DreamhubBulkOperator(BaseOperator):
         *,
         entity: str,
         operation: str,
-        records: list[dict[str, Any]] | str | None = None,
+        records: list[Record] | str | None = None,
         input_path: str | None = None,
         input_format: str = "ndjson",
         match_field: str | None = None,
@@ -90,6 +91,8 @@ class DreamhubBulkOperator(BaseOperator):
         results_path: str | None = None,
         dreamhub_conn_id: str = DreamhubHook.default_conn_name,
         storage_conn_id: str | None = None,
+        # Airflow's own operator arguments (task_id, retries, ...), forwarded unchanged: they are
+        # BaseOperator's to type, and this is the one place `Any` remains.
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -117,10 +120,10 @@ class DreamhubBulkOperator(BaseOperator):
         self.dreamhub_conn_id = dreamhub_conn_id
         self.storage_conn_id = storage_conn_id
 
-    def execute(self, context: Any) -> dict[str, Any]:
+    def execute(self, context: Context) -> Record:
         records = self._load_records()
         hook = DreamhubHook(dreamhub_conn_id=self.dreamhub_conn_id)
-        unmatched: list[dict[str, Any]] = []
+        unmatched: list[Record] = []
         positions = list(range(len(records)))
         try:
             if self.match_field:
@@ -160,8 +163,10 @@ class DreamhubBulkOperator(BaseOperator):
             hook.close()
         return self._report(self._in_input_terms(result, positions, unmatched))
 
-    def _load_records(self) -> list[dict[str, Any]]:
+    def _load_records(self) -> list[Record]:
         if self.records is None:
+            if self.input_path is None:  # __init__ requires one of the two
+                raise ValueError("pass records or input_path")
             source = RecordFile(self.input_path, self.input_format, conn_id=self.storage_conn_id)
             return list(source.read())
         records = self.records
@@ -175,9 +180,7 @@ class DreamhubBulkOperator(BaseOperator):
             raise TypeError("records must be a list of objects or a JSON array of objects")
         return list(records)
 
-    def _attach_ids(
-        self, hook: DreamhubHook, records: list[dict[str, Any]]
-    ) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]]]:
+    def _attach_ids(self, hook: DreamhubHook, records: list[Record]) -> tuple[list[Record], list[int], list[Record]]:
         """Give each record the id of the one Dreamhub record holding its ``match_field`` value.
 
         Returns the records to send, the input position of each, and the failures of records
@@ -188,9 +191,9 @@ class DreamhubBulkOperator(BaseOperator):
         if field is None:
             return records, list(range(len(records))), []
         matches = hook.resolve_ids(self.entity, field, (r.get(field) for r in records))
-        ready: list[dict[str, Any]] = []
+        ready: list[Record] = []
         positions: list[int] = []
-        failed: list[dict[str, Any]] = []
+        failed: list[Record] = []
         for position, record in enumerate(records):
             key = hook.match_key(record.get(field))
             ids = matches.get(key, []) if key is not None else []
@@ -211,7 +214,7 @@ class DreamhubBulkOperator(BaseOperator):
         return ready, positions, failed
 
     @staticmethod
-    def _in_input_terms(result: BulkResult, positions: list[int], unmatched: list[dict[str, Any]]) -> BulkResult:
+    def _in_input_terms(result: BulkResult, positions: list[int], unmatched: list[Record]) -> BulkResult:
         """Rewrite position keys from the list sent to the API into positions in the caller's input."""
         failures = list(unmatched)
         for failure in result.failures:
@@ -225,7 +228,7 @@ class DreamhubBulkOperator(BaseOperator):
 
     def _finish(
         self, result: BulkResult, *, unknown: list[int] | None = None, not_attempted: list[int] | None = None
-    ) -> dict[str, Any]:
+    ) -> Record:
         """Write the full result where asked and log what happened, without record values or reasons.
 
         For a run that stopped part-way, the summary also lists the input positions whose
@@ -233,8 +236,10 @@ class DreamhubBulkOperator(BaseOperator):
         """
         summary = result.to_dict()
         if unknown is not None:
-            summary["unknown_positions"] = unknown
-            summary["not_attempted_positions"] = not_attempted or []
+            unknown_positions: list[JsonValue] = [*unknown]
+            not_attempted_positions: list[JsonValue] = [*(not_attempted or [])]
+            summary["unknown_positions"] = unknown_positions
+            summary["not_attempted_positions"] = not_attempted_positions
         if self.results_path:
             RecordFile(self.results_path, "ndjson", conn_id=self.storage_conn_id).write([summary])
         self.log.info(
@@ -251,13 +256,16 @@ class DreamhubBulkOperator(BaseOperator):
             )
         return summary
 
-    def _report(self, result: BulkResult) -> dict[str, Any]:
+    def _report(self, result: BulkResult) -> Record:
         summary = self._finish(result)
         if result.failed and self.fail_on_partial:
             where = f"see {self.results_path} and the task log" if self.results_path else "see the task log"
             raise DreamhubRecordsFailedError(
                 f"{result.failed} of {result.succeeded + result.failed} records failed; {where}", summary
             )
-        summary["failures"] = summary["failures"][:MAX_FAILURES_IN_XCOM]
-        summary["succeeded_ids"] = summary["succeeded_ids"][:MAX_IDS_IN_XCOM]
+        failures, ids = summary["failures"], summary["succeeded_ids"]
+        if isinstance(failures, list):
+            summary["failures"] = failures[:MAX_FAILURES_IN_XCOM]
+        if isinstance(ids, list):
+            summary["succeeded_ids"] = ids[:MAX_IDS_IN_XCOM]
         return summary

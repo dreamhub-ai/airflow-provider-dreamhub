@@ -48,6 +48,19 @@ class TestRoutes:
             hook.get_records("compnies")
 
     @respx.mock
+    def test_a_proxy_page_answering_404_is_an_error_not_an_empty_read(self, hook: DreamhubHook) -> None:
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=httpx.Response(404, text="<html>Not Found</html>"))
+
+        with pytest.raises(DreamhubApiError):
+            hook.get_records("companies")
+
+    @respx.mock
+    def test_a_base_url_that_does_not_serve_the_api_fails_the_connection_test(self, hook: DreamhubHook) -> None:
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=httpx.Response(404, json={"detail": "Not Found"}))
+
+        assert hook.test_connection() == (False, "The API base URL does not serve the Dreamhub API")
+
+    @respx.mock
     def test_nothing_matching_is_still_an_empty_read(self, hook: DreamhubHook) -> None:
         respx.post(f"{BASE_URL}/companies/filter").mock(
             return_value=httpx.Response(404, json={"detail": "No companies found"})
@@ -76,9 +89,12 @@ class TestRoutes:
         assert hook.resolve_ids("companies", "account_number", ["A-1"]) == {"A-1": ["c-1"]}
         assert route.calls[0].request.url.params["include_additionals"] == "true"
 
-    def test_activity_reads_are_refused_by_the_generic_operator(self) -> None:
+    @pytest.mark.parametrize(
+        "endpoint", ["companies/c-1/activities/filter", "companies/c-1/activities/filter?page=1&size=100"]
+    )
+    def test_activity_reads_are_refused_by_the_generic_operator(self, endpoint: str) -> None:
         with pytest.raises(ValueError, match="activities"):
-            DreamhubApiOperator(task_id="call", endpoint="companies/c-1/activities/filter", method="post").execute({})
+            DreamhubApiOperator(task_id="call", endpoint=endpoint, method="post").execute({})
 
     @respx.mock
     def test_activity_writes_still_pass_through_the_generic_operator(self) -> None:
@@ -100,7 +116,11 @@ class TestRetryWait:
         hook = DreamhubHook(dreamhub_conn_id="dreamhub_capped")
         hook._sleep = sleeps.append
         respx.post(f"{BASE_URL}/companies/filter").mock(
-            side_effect=[httpx.Response(429), httpx.Response(429), httpx.Response(404, json={"detail": "No"})]
+            side_effect=[
+                httpx.Response(429),
+                httpx.Response(429),
+                httpx.Response(404, json={"detail": "No companies found"}),
+            ]
         )
         try:
             hook.get_records("companies")
@@ -132,7 +152,9 @@ class TestBulkOutcomes:
 
         result = hook.bulk("deals", "update", [{"id": "d-1"}, {"id": "d-2"}])
 
-        assert result.failures == [{"key": "d-2", "error": "not reported by Dreamhub"}]
+        assert result.failures == [
+            {"key": "d-2", "error": "outcome not reported by Dreamhub; it may have been written"}
+        ]
 
     @respx.mock
     def test_new_records_the_response_leaves_out_stop_the_run_as_unknown(self, hook: DreamhubHook) -> None:
@@ -156,6 +178,26 @@ class TestBulkOutcomes:
 
         assert raised.value.result.succeeded_ids == ["c-1"]
         assert (raised.value.unknown, raised.value.not_attempted) == ([1], [2])
+
+    @respx.mock
+    def test_a_delete_answered_by_a_gateway_error_is_sent_again(self, hook: DreamhubHook) -> None:
+        route = respx.delete(f"{BASE_URL}/companies/c-1").mock(side_effect=[httpx.Response(502), httpx.Response(204)])
+
+        result = hook.bulk("companies", "delete", [{"id": "c-1"}])
+
+        assert result.succeeded_ids == ["c-1"]
+        assert route.call_count == 2
+
+    @respx.mock
+    def test_an_id_listed_twice_still_accounts_for_two_new_records(self, hook: DreamhubHook) -> None:
+        respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(
+            return_value=httpx.Response(200, json={"successfulIds": ["c-1", "c-1"], "errors": {}})
+        )
+
+        result = hook.bulk("companies", "upsert", [_company(), _company()])
+
+        assert result.succeeded_ids == ["c-1", "c-1"]
+        assert result.failures == []
 
 
 class TestOperatorReports:
@@ -218,4 +260,6 @@ class TestLocalFiles:
         RecordFile(str(target), "ndjson").write([{"id": "c-1"}])
 
         assert modes == [0o600]
-        assert target.stat().st_mode & 0o777 == 0o666 & ~files._UMASK
+        umask = os.umask(0o077)
+        os.umask(umask)
+        assert target.stat().st_mode & 0o777 == 0o666 & ~umask

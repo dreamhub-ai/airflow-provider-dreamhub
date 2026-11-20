@@ -26,7 +26,7 @@ class TestReadEnd:
         respx.post(f"{BASE_URL}/companies/filter").mock(
             side_effect=[
                 _rows("companies", [{"id": "c-1"}, {"id": "c-2"}], total=2),
-                httpx.Response(404, json={"detail": "Not found"}),
+                httpx.Response(404, json={"detail": "No companies found"}),
             ]
         )
 
@@ -37,7 +37,7 @@ class TestReadEnd:
         respx.post(f"{BASE_URL}/companies/filter").mock(
             side_effect=[
                 _rows("companies", [{"id": "c-1"}, {"id": "c-2"}], total=3),
-                httpx.Response(404, json={"detail": "Not found"}),
+                httpx.Response(404, json={"detail": "No companies found"}),
             ]
         )
 
@@ -112,7 +112,9 @@ class TestExtractLeavesOutputOnFailure:
 class TestUpsertByMatchField:
     @respx.mock
     def test_an_unmatched_record_is_created_even_if_it_carries_an_id(self) -> None:
-        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=httpx.Response(404))
+        respx.post(f"{BASE_URL}/companies/filter").mock(
+            return_value=httpx.Response(404, json={"detail": "No companies found"})
+        )
         upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(
             return_value=httpx.Response(200, json={"successfulIds": ["c-new"], "errors": {}})
         )

@@ -10,15 +10,13 @@ import secrets
 import stat
 import tempfile
 from collections.abc import Iterable, Iterator, Sequence
-from typing import Any, TextIO
+from typing import TextIO
 
 from dreamhub_airflow._compat import ObjectStoragePath
+from dreamhub_airflow.records import Record
 
 FILE_FORMATS = ("ndjson", "csv")
 _COPY_CHUNK = 1 << 20
-# The process umask, read once at import: a new local file gets the mode a plain open would give it.
-_UMASK = os.umask(0)
-os.umask(_UMASK)
 # Spreadsheet applications run a cell starting with one of these as a formula.
 FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
@@ -34,7 +32,7 @@ class RecordFile:
         self.file_format = file_format
 
     def write(
-        self, records: Iterable[dict[str, Any]], fields: Sequence[str] | None = None, neutralize_formulas: bool = True
+        self, records: Iterable[Record], fields: Sequence[str] | None = None, neutralize_formulas: bool = True
     ) -> int:
         """Write ``records`` and return how many were written.
 
@@ -57,7 +55,7 @@ class RecordFile:
         return count
 
     def _write_local(
-        self, target: str, records: Iterable[dict[str, Any]], fields: Sequence[str] | None, neutralize_formulas: bool
+        self, target: str, records: Iterable[Record], fields: Sequence[str] | None, neutralize_formulas: bool
     ) -> int:
         # The destination itself is replaced, never a file a symlink there points to.
         target = os.path.abspath(target)
@@ -71,7 +69,7 @@ class RecordFile:
         try:
             with os.fdopen(handle, "w", encoding="utf-8", newline="") as staged_file:
                 count = self._write_records(staged_file, records, fields, neutralize_formulas)
-            os.chmod(staged, existing_mode if existing_mode is not None else 0o666 & ~_UMASK)
+            os.chmod(staged, existing_mode if existing_mode is not None else _default_file_mode())
             os.replace(staged, target)
         except BaseException:
             with contextlib.suppress(FileNotFoundError):
@@ -80,19 +78,19 @@ class RecordFile:
         return count
 
     def _write_records(
-        self, handle: TextIO, records: Iterable[dict[str, Any]], fields: Sequence[str] | None, neutralize_formulas: bool
+        self, handle: TextIO, records: Iterable[Record], fields: Sequence[str] | None, neutralize_formulas: bool
     ) -> int:
         if self.file_format == "ndjson":
             return self._write_ndjson(handle, records, fields)
         return self._write_csv(handle, records, fields, neutralize_formulas)
 
-    def read(self) -> Iterator[dict[str, Any]]:
+    def read(self) -> Iterator[Record]:
         """Read the records back. In CSV every value is text, and an empty cell is read as null
         (``None``), so a blank cell never overwrites a stored value when ``override`` is off."""
         with self.path.open("r", encoding="utf-8", newline="") as handle:
             # Airflow 2 wraps the file in an object that forwards method calls but cannot be
             # iterated, so read line by line through readline.
-            lines = iter(handle.readline, "")
+            lines = (str(line) for line in iter(handle.readline, ""))
             if self.file_format == "ndjson":
                 for line in lines:
                     if line.strip():
@@ -102,7 +100,7 @@ class RecordFile:
                     yield {key: (value if value != "" else None) for key, value in row.items()}
 
     @staticmethod
-    def _write_ndjson(handle: TextIO, records: Iterable[dict[str, Any]], fields: Sequence[str] | None) -> int:
+    def _write_ndjson(handle: TextIO, records: Iterable[Record], fields: Sequence[str] | None) -> int:
         count = 0
         for record in records:
             handle.write(json.dumps(_select(record, fields), default=str, ensure_ascii=False))
@@ -112,7 +110,7 @@ class RecordFile:
 
     @classmethod
     def _write_csv(
-        cls, handle: TextIO, records: Iterable[dict[str, Any]], fields: Sequence[str] | None, neutralize_formulas: bool
+        cls, handle: TextIO, records: Iterable[Record], fields: Sequence[str] | None, neutralize_formulas: bool
     ) -> int:
         if fields is not None:
             return cls._write_csv_rows(handle, records, list(fields), neutralize_formulas)
@@ -129,7 +127,7 @@ class RecordFile:
 
     @staticmethod
     def _write_csv_rows(
-        handle: TextIO, records: Iterable[dict[str, Any]], columns: list[str], neutralize_formulas: bool
+        handle: TextIO, records: Iterable[Record], columns: list[str], neutralize_formulas: bool
     ) -> int:
         count = 0
         writer = csv.writer(handle)
@@ -156,13 +154,13 @@ def _local_path(path: str) -> str | None:
     return None if "://" in path else path
 
 
-def _select(record: dict[str, Any], fields: Sequence[str] | None) -> dict[str, Any]:
+def _select(record: Record, fields: Sequence[str] | None) -> Record:
     if fields is None:
         return record
     return {name: record.get(name) for name in fields}
 
 
-def _cell(value: Any, neutralize_formulas: bool) -> str:
+def _cell(value: object, neutralize_formulas: bool) -> str:
     if value is None:
         return ""
     if isinstance(value, (dict, list)):
@@ -176,5 +174,16 @@ def _cell(value: Any, neutralize_formulas: bool) -> str:
     return text
 
 
-def _is_number(value: Any) -> bool:
+def _is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _default_file_mode() -> int:
+    """The mode a plain open would give a new file under the current umask.
+
+    The umask can only be read by setting it; it is set to 0o077 for that instant, so a file another
+    thread creates meanwhile is more private than intended, never less.
+    """
+    umask = os.umask(0o077)
+    os.umask(umask)
+    return 0o666 & ~umask

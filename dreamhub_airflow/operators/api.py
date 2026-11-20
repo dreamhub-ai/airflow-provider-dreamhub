@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection
 from typing import Any
 
-from dreamhub_airflow._compat import BaseOperator
+from dreamhub_airflow._compat import BaseOperator, Context
 from dreamhub_airflow.hooks.dreamhub import DreamhubHook
+from dreamhub_airflow.records import JsonValue, QueryParams
 
 READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
@@ -26,7 +27,7 @@ class DreamhubApiOperator(BaseOperator):
     :param query_params: Query parameters. Templated.
     """
 
-    template_fields: Sequence[str] = ("endpoint", "data", "query_params")
+    template_fields: Collection[str] = ("endpoint", "data", "query_params")
     template_fields_renderers = {"data": "json", "query_params": "json"}
 
     def __init__(
@@ -34,10 +35,12 @@ class DreamhubApiOperator(BaseOperator):
         *,
         endpoint: str,
         method: str = "GET",
-        data: Any = None,
-        query_params: dict[str, Any] | None = None,
+        data: JsonValue = None,
+        query_params: QueryParams | None = None,
         retry_writes: bool = False,
         dreamhub_conn_id: str = DreamhubHook.default_conn_name,
+        # Airflow's own operator arguments (task_id, retries, ...), forwarded unchanged: they are
+        # BaseOperator's to type, and this is the one place `Any` remains.
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -48,8 +51,9 @@ class DreamhubApiOperator(BaseOperator):
         self.retry_writes = retry_writes
         self.dreamhub_conn_id = dreamhub_conn_id
 
-    def execute(self, context: Any) -> Any:
-        if self.method in READ_METHODS or self.endpoint.rstrip("/").endswith(("/filter", "/fetch")):
+    def execute(self, context: Context) -> JsonValue:
+        path = self.endpoint.partition("?")[0].rstrip("/")
+        if self.method in READ_METHODS or path.endswith(("/filter", "/fetch")):
             # Reads of activities are refused here as in the extract: the API returns rows beyond
             # the requested record. Activity writes are not affected.
             DreamhubHook.check_readable(self.endpoint)
