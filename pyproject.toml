@@ -34,6 +34,10 @@ test = [
 lint = [
     "ruff>=0.6",
 ]
+# The live harness: runs the provider in a real Airflow container (tests/live, marker airflow_live).
+live = [
+    "python-on-whales>=0.73",
+]
 
 [project.urls]
 Homepage = "https://github.com/dreamhub-ai/airflow-provider-dreamhub"
@@ -53,9 +57,10 @@ include = ["dreamhub_airflow", "tests", "example_dags", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not e2e'"
+addopts = "-m 'not e2e and not airflow_live'"
 markers = [
     "e2e: end-to-end tests against a real Dreamhub environment (needs DREAMHUB_E2E_URL and DREAMHUB_E2E_TOKEN)",
+    "airflow_live: the provider in a real Airflow container against the Dreamhub development environment (writes test records and deletes them; see CONTRIBUTING.md)",
 ]
 
 [tool.coverage.run]

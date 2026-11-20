@@ -26,6 +26,57 @@ welcome community contributions.
    ```
 5. Push your branch and open a pull request against `main`.
 
+## Live test in a real Airflow (Dreamhub maintainers)
+
+`tests/live` runs the provider inside real Airflow 2 and Airflow 3 containers (the official
+`apache/airflow` images in standalone mode) against Dreamhub's development environment. It is
+not part of the default test run and needs credentials only Dreamhub maintainers have.
+
+It builds the provider wheel from your checkout and installs it in each Airflow. Then it runs
+these DAGs through the Airflow scheduler:
+
+- **Extract**: companies and revenue items to NDJSON files. The line counts must equal the API's
+  totals.
+- **Bulk**: create test companies, then update and upsert them by a match field, and clear a
+  field with `override=True`.
+- **Delete**: delete the test companies by the match field.
+- **Rate limit**: an extract through a local proxy that answers `429` with `Retry-After` first.
+  The task must wait and finish.
+- **Failures**: an invalid record and a refused token. Both tasks must fail with a reason, and
+  nothing may be written.
+
+Every record a run writes carries the run's marker. When the run ends, anything still there is
+deleted and counted; leftover records fail the run. No task log or container output may contain
+the token.
+
+1. Install the extra tools and start Docker:
+   ```bash
+   .venv/bin/pip install -e ".[test,lint,live]"
+   ```
+2. Put an API key of a dedicated test user in a file only you can read, and set the development
+   API URL (ask the team; the harness refuses any other environment):
+   ```bash
+   install -m 600 /dev/null ~/.dreamhub-live-token   # then paste the key into it
+   export DREAMHUB_LIVE_TOKEN_FILE=~/.dreamhub-live-token
+   export DREAMHUB_LIVE_URL=<development API URL ending in /api/v1>
+   ```
+   `DREAMHUB_LIVE_TOKEN` works too. The token reaches Airflow through an owner-only env file,
+   never through a command line.
+3. Run it:
+   ```bash
+   .venv/bin/pytest -m airflow_live -v
+   ```
+   `DREAMHUB_LIVE_AIRFLOW=3` (or `2`) runs one Airflow version only. `DREAMHUB_LIVE_LABELS=key=value,...`
+   adds labels to the containers. The summary at the end lists each run's marker and cleanup
+   counts.
+
+**See the runs in the Airflow UI.** Run with `DREAMHUB_LIVE_KEEP=1` and the containers stay up
+after the test. The UI is published on `127.0.0.1` only (port 8082 for Airflow 2, 8083 for
+Airflow 3). The summary prints each UI's address, the command that shows its generated login, and
+the command that removes the container. The Dreamhub connections are environment variables, so the
+UI's Connections page does not show them; remove the container when you are done, and revoke the
+test key when you no longer need it.
+
 ## Pull Request Guidelines
 
 - Reference the GitHub issue your PR addresses (e.g., `Fixes #123`).
