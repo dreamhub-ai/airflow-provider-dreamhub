@@ -38,16 +38,25 @@ _LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 class DreamhubApiError(Exception):
     """The API answered with an error the hook does not handle itself."""
 
-    def __init__(self, method: str, path: str, status_code: int, detail: str | None = None) -> None:
+    def __init__(
+        self,
+        method: str,
+        path: str,
+        status_code: int,
+        detail: str | None = None,
+        item_errors: dict[int, str] | None = None,
+    ) -> None:
         self.method = method
         self.path = path
         self.status_code = status_code
         self.detail = detail
+        # For a request body that is a list: the reason the API gave for each item, by position.
+        self.item_errors = item_errors or {}
         message = f"Dreamhub API {method} {path} failed with HTTP {status_code}"
         super().__init__(f"{message}: {detail}" if detail else message)
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (type(self), (self.method, self.path, self.status_code, self.detail))
+        return (type(self), (self.method, self.path, self.status_code, self.detail, self.item_errors))
 
 
 class DreamhubConsistencyError(Exception):
@@ -269,7 +278,7 @@ class DreamhubHook(BaseHook):
             if status == 404 and allow_not_found:
                 return response
             if status >= 400:
-                raise DreamhubApiError(method, url, status, _short_detail(response))
+                raise DreamhubApiError(method, url, status, _short_detail(response), _item_errors(response))
             return response
 
     def _wait(self, seconds: float, method: str, path: str, reason: str) -> None:
@@ -537,6 +546,18 @@ class DreamhubHook(BaseHook):
                         {"key": BulkResult.record_key(record, offset + position), "error": error.detail}
                     )
                 return
+            if error.status_code == 422:
+                # The request failed validation, which runs before anything is written, so
+                # every record of the batch failed: with its own reason, or because of another's.
+                for item, (position, record) in enumerate(zip(positions, sent, strict=True)):
+                    if item in error.item_errors:
+                        reason = error.item_errors[item]
+                    elif error.item_errors:
+                        reason = "not written: another record in the same request is invalid"
+                    else:
+                        reason = error.detail or "HTTP 422"
+                    result.failures.append({"key": BulkResult.record_key(record, offset + position), "error": reason})
+                return
             raise
         payload = response.json()
         result.succeeded_ids.extend(str(i) for i in payload.get("successfulIds") or [])
@@ -702,4 +723,41 @@ def _short_detail(response: httpx.Response) -> str | None:
         return None
     if isinstance(detail, str):
         return detail[:200]
-    return None
+    reasons = list(dict.fromkeys(reason for _, reason in _validation_errors(detail)))
+    return "; ".join(reasons)[:200] or None
+
+
+def _item_errors(response: httpx.Response) -> dict[int, str]:
+    """The API's validation reasons for a list body, by the position of the item they concern."""
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        return {}
+    by_item: dict[int, list[str]] = {}
+    for item, reason in _validation_errors(detail):
+        if item is not None:
+            by_item.setdefault(item, []).append(reason)
+    return {item: "; ".join(reasons)[:200] for item, reasons in by_item.items()}
+
+
+def _validation_errors(detail: Any) -> list[tuple[int | None, str]]:
+    """``(item position, "field: message")`` for each entry of a request-validation error.
+
+    Only the field and the message are kept: the entry's ``input`` holds the rejected value,
+    which can be personal data, so it is never read.
+    """
+    if not isinstance(detail, list):
+        return []
+    errors = []
+    for entry in detail:
+        if not isinstance(entry, dict) or not isinstance(entry.get("msg"), str):
+            continue
+        loc = list(entry.get("loc") or [])
+        if loc and loc[0] == "body":
+            loc = loc[1:]
+        item = None
+        if loc and isinstance(loc[0], int) and not isinstance(loc[0], bool):
+            item, loc = loc[0], loc[1:]
+        field = ".".join(str(part) for part in loc)
+        errors.append((item, f"{field}: {entry['msg']}" if field else entry["msg"]))
+    return errors

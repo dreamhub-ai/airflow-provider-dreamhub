@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 
@@ -259,6 +260,65 @@ class TestBulk:
             {"key": "d-1", "error": "Bulk update failed for all entities"},
             {"key": "d-2", "error": "Bulk update failed for all entities"},
         ]
+
+    @respx.mock
+    def test_a_batch_refused_as_invalid_fails_each_record_with_its_reason_and_no_value(self, hook):
+        respx.post(f"{BASE_URL}/companies/bulk/create").mock(
+            return_value=httpx.Response(
+                422,
+                json={
+                    "detail": [
+                        {
+                            "type": "missing",
+                            "loc": ["body", 1, "status"],
+                            "msg": "Field required",
+                            "input": {"name": "Private Co", "phone": "+1 555 0100"},
+                        }
+                    ]
+                },
+            )
+        )
+
+        result = hook.bulk("companies", "create", [{"name": "A", "status": 1}, {"name": "Private Co"}])
+
+        assert result.failures == [
+            {"key": 0, "error": "not written: another record in the same request is invalid"},
+            {"key": 1, "error": "status: Field required"},
+        ]
+        assert result.succeeded_ids == []
+        assert "Private Co" not in json.dumps(result.failures)
+        assert "555" not in json.dumps(result.failures)
+
+    @respx.mock
+    def test_a_refused_update_keys_failures_by_the_records_sent_not_the_ones_held_back(self, hook):
+        respx.put(f"{BASE_URL}/deals/bulk/update").mock(
+            return_value=httpx.Response(
+                422, json={"detail": [{"loc": ["body", 0, "amount"], "msg": "Input should be a valid number"}]}
+            )
+        )
+
+        result = hook.bulk("deals", "update", [{"name": "no id"}, {"id": "d-2", "amount": "x"}])
+
+        assert result.failures == [
+            {"key": 0, "error": "record has no id"},
+            {"key": "d-2", "error": "amount: Input should be a valid number"},
+        ]
+
+    @respx.mock
+    def test_a_validation_error_names_the_field_but_not_the_value(self, hook):
+        respx.post(f"{BASE_URL}/deals/filter").mock(
+            return_value=httpx.Response(
+                422,
+                json={"detail": [{"loc": ["body", "sort", "field"], "msg": "Field required", "input": "secret"}]},
+            )
+        )
+
+        with pytest.raises(DreamhubApiError) as raised:
+            hook.request("POST", "deals/filter", json={})
+
+        assert raised.value.detail == "sort.field: Field required"
+        assert "secret" not in str(raised.value)
+        assert pickle.loads(pickle.dumps(raised.value)).detail == raised.value.detail
 
     @respx.mock
     def test_an_unexpected_server_error_still_fails_the_write(self, hook):

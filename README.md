@@ -137,6 +137,8 @@ Notes:
 - The task returns at most 100 failures and 1,000 ids; set `results_path` to keep the complete result.
 - `delete` is a soft delete, one request per record; `batch_size` and `override` do not apply to it.
 - When every record of a batch fails, Dreamhub reports one reason for the whole batch.
+- A batch that fails Dreamhub's input checks (for example a required field is missing) is not written at all:
+  each invalid record fails with the field and the reason, and the others of that batch fail as "not written".
 
 ## Other endpoints
 
