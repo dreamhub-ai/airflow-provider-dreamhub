@@ -388,6 +388,11 @@ class TestARunThatStopsPartWay:
                 results_path=str(tmp_path / "results.ndjson"),
             ).execute({})
 
+    def test_a_new_record_key_reads_back_as_its_number_and_position(self) -> None:
+        assert BulkResult.parse_new_record_key(BulkResult.new_record_key(3, 200)) == (3, 200)
+        assert BulkResult.parse_new_record_key("new record 3 of the batch") is None
+        assert BulkResult.parse_new_record_key(7) is None
+
     def test_the_stop_error_survives_pickling(self) -> None:
         error = DreamhubBulkError(BulkResult("create", ["c-1"]), [1], [2], DreamhubApiError("POST", "x", 504))
 

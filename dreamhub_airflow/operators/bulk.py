@@ -15,8 +15,6 @@ from dreamhub_airflow.hooks.dreamhub import (
     BulkResult,
     DreamhubBulkError,
     DreamhubHook,
-    new_record_key,
-    parse_new_record_key,
 )
 
 # XCom is for small values: the task returns samples, and ``results_path`` holds everything.
@@ -205,8 +203,8 @@ class DreamhubBulkOperator(BaseOperator):
             key = failure["key"]
             if isinstance(key, int) and 0 <= key < len(positions):
                 failure = {**failure, "key": positions[key]}
-            elif (parsed := parse_new_record_key(key)) is not None and parsed[1] < len(positions):
-                failure = {**failure, "key": new_record_key(parsed[0], positions[parsed[1]])}
+            elif (parsed := BulkResult.parse_new_record_key(key)) is not None and parsed[1] < len(positions):
+                failure = {**failure, "key": BulkResult.new_record_key(parsed[0], positions[parsed[1]])}
             failures.append(failure)
         return BulkResult(operation=result.operation, succeeded_ids=result.succeeded_ids, failures=failures)
 
