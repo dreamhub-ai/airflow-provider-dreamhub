@@ -646,10 +646,16 @@ class DreamhubHook(BaseHook):
         """A record the response neither confirms nor reports as failed has an unknown outcome."""
         listed = payload.get("successfulIds")
         listed = listed if isinstance(listed, list) else []
-        # The raw count, not the distinct ids: a response may name one stored record for two inputs.
-        if len(listed) + len(reported) >= len(sent):
-            return
         succeeded = {str(i) for i in listed}
+        # The raw count, not the distinct ids: a response may name one stored record for two new
+        # inputs. A record sent with its id is checked by that id, so a repeated id cannot hide it.
+        every_id_seen = all(
+            str(record["id"]) in succeeded or str(record["id"]) in reported
+            for record in sent
+            if DreamhubHook._has_id(record)
+        )
+        if every_id_seen and len(listed) + len(reported) >= len(sent):
+            return
         unknown: list[int] = []
         for position, record in zip(positions, sent, strict=True):
             key = str(BulkResult.record_key(record, offset + position))
@@ -798,14 +804,18 @@ def _flag(value: bool) -> str:
 
 
 def _rows(payload: JsonValue, items_key: str) -> list[Record]:
-    # A row that is not an object is dropped; the count check then reports the short read.
-    if isinstance(payload, list):
-        return [row for row in payload if isinstance(row, dict)]
+    rows: JsonValue = payload
     if isinstance(payload, dict):
-        for key in (items_key, _camel(items_key), "items"):
-            rows = payload.get(key)
-            if isinstance(rows, list):
-                return [row for row in rows if isinstance(row, dict)]
+        rows = next(
+            (payload[key] for key in (items_key, _camel(items_key), "items") if isinstance(payload.get(key), list)),
+            None,
+        )
+    if isinstance(rows, list):
+        records = [row for row in rows if isinstance(row, dict)]
+        if len(records) == len(rows):
+            return records
+        # A page with a row that is not a record cannot be counted or paged reliably.
+        raise DreamhubApiError("POST", items_key, 200, summary="response has a row that is not a record")
     raise DreamhubApiError(
         "POST", items_key, 200, "response has no list of records", summary="response has no list of records"
     )

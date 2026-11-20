@@ -9,6 +9,7 @@ import os
 import secrets
 import stat
 import tempfile
+import threading
 from collections.abc import Iterable, Iterator, Sequence
 from typing import TextIO
 
@@ -178,12 +179,18 @@ def _is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+# Reading the umask means setting it; serialised so two writers cannot leave it changed.
+_UMASK_LOCK = threading.Lock()
+
+
 def _default_file_mode() -> int:
     """The mode a plain open would give a new file under the current umask.
 
     The umask can only be read by setting it; it is set to 0o077 for that instant, so a file another
-    thread creates meanwhile is more private than intended, never less.
+    thread creates meanwhile is more private than intended, never less, and the lock makes sure the
+    original umask is always the one restored.
     """
-    umask = os.umask(0o077)
-    os.umask(umask)
+    with _UMASK_LOCK:
+        umask = os.umask(0o077)
+        os.umask(umask)
     return 0o666 & ~umask

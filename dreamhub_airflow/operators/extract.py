@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 from dreamhub_airflow._compat import BaseOperator, Context
@@ -29,7 +29,8 @@ class DreamhubExtractOperator(BaseOperator):
         with ``'`` (default). Set False when loading the file into a warehouse.
     """
 
-    template_fields: Collection[str] = ("entity", "output_path", "filters")
+    # Unannotated: Airflow 2 and 3 declare this attribute with different types.
+    template_fields = ("entity", "output_path", "filters")
     template_fields_renderers = {"filters": "json"}
     ui_color = "#e8f4fd"
 
@@ -47,7 +48,7 @@ class DreamhubExtractOperator(BaseOperator):
         dreamhub_conn_id: str = DreamhubHook.default_conn_name,
         storage_conn_id: str | None = None,
         # Airflow's own operator arguments (task_id, retries, ...), forwarded unchanged: they are
-        # BaseOperator's to type, and this is the one place `Any` remains.
+        # BaseOperator's to type, so this is the only `Any` in this operator.
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)

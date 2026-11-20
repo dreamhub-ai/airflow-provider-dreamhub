@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import pickle
+from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -14,7 +16,7 @@ import respx
 from dreamhub_airflow import files
 from dreamhub_airflow.entities import EntityRoute
 from dreamhub_airflow.files import RecordFile
-from dreamhub_airflow.hooks.dreamhub import DreamhubApiError, DreamhubBulkError, DreamhubHook
+from dreamhub_airflow.hooks.dreamhub import DreamhubApiError, DreamhubBulkError, DreamhubHook, _UnreportedRecords
 from dreamhub_airflow.operators.api import DreamhubApiOperator
 from dreamhub_airflow.operators.bulk import DreamhubBulkOperator, DreamhubRecordsFailedError
 from tests.helpers import BASE_URL
@@ -263,3 +265,73 @@ class TestLocalFiles:
         umask = os.umask(0o077)
         os.umask(umask)
         assert target.stat().st_mode & 0o777 == 0o666 & ~umask
+
+    def test_concurrent_writes_leave_the_process_umask_as_it_was(self, tmp_path: Path) -> None:
+        before = os.umask(0o022)
+        try:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(
+                    pool.map(
+                        lambda i: RecordFile(str(tmp_path / f"out-{i}.ndjson"), "ndjson").write([{"id": i}]), range(64)
+                    )
+                )
+            assert os.umask(0o022) == 0o022
+        finally:
+            os.umask(before)
+
+
+class TestShapes:
+    @respx.mock
+    def test_a_row_that_is_not_a_record_is_an_error(self, hook: DreamhubHook) -> None:
+        respx.post(f"{BASE_URL}/companies/filter").mock(
+            return_value=httpx.Response(200, json={"companies": [{"id": "c-1"}, "oops"], "total": 2})
+        )
+
+        with pytest.raises(DreamhubApiError, match="not a record"):
+            hook.get_records("companies")
+
+    @respx.mock
+    def test_a_repeated_id_cannot_hide_a_record_sent_with_its_id(self, hook: DreamhubHook) -> None:
+        respx.put(f"{BASE_URL}/deals/bulk/update").mock(
+            return_value=httpx.Response(200, json={"successfulIds": ["d-1", "d-1"], "errors": {}})
+        )
+
+        result = hook.bulk("deals", "update", [{"id": "d-1"}, {"id": "d-2"}])
+
+        assert result.failures == [
+            {"key": "d-2", "error": "outcome not reported by Dreamhub; it may have been written"}
+        ]
+
+    @respx.mock
+    def test_a_match_value_that_is_not_json_is_sent_as_text(self, hook: DreamhubHook) -> None:
+        route = respx.post(f"{BASE_URL}/companies/filter").mock(
+            return_value=httpx.Response(404, json={"detail": "No companies found"})
+        )
+
+        hook.resolve_ids("companies", "account_number", [Decimal("12.5")])
+
+        assert json.loads(route.calls[0].request.content)["filters"] == {"account_number": ["12.5"]}
+
+    def test_the_unreported_records_stop_survives_pickling(self) -> None:
+        copy = pickle.loads(pickle.dumps(_UnreportedRecords([3, 4])))
+
+        assert (copy.positions, str(copy)) == ([3, 4], "2 new records were neither confirmed nor reported as failed")
+
+    @respx.mock
+    def test_a_delete_whose_connection_dropped_is_sent_again(self, hook: DreamhubHook) -> None:
+        calls: list[int] = []
+
+        def flaky(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) == 1:
+                raise httpx.ReadTimeout("no answer", request=request)
+            return httpx.Response(204)
+
+        respx.delete(f"{BASE_URL}/companies/c-1").mock(side_effect=flaky)
+
+        assert hook.bulk("companies", "delete", [{"id": "c-1"}]).succeeded_ids == ["c-1"]
+        assert len(calls) == 2
+
+    def test_a_percent_encoded_activity_read_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="activities"):
+            DreamhubApiOperator(task_id="call", endpoint="companies/c-1/activities/fil%74er", method="post").execute({})

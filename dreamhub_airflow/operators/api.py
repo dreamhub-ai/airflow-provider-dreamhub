@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
 from typing import Any
+from urllib.parse import unquote
 
 from dreamhub_airflow._compat import BaseOperator, Context
 from dreamhub_airflow.hooks.dreamhub import DreamhubHook
@@ -27,7 +27,8 @@ class DreamhubApiOperator(BaseOperator):
     :param query_params: Query parameters. Templated.
     """
 
-    template_fields: Collection[str] = ("endpoint", "data", "query_params")
+    # Unannotated: Airflow 2 and 3 declare this attribute with different types.
+    template_fields = ("endpoint", "data", "query_params")
     template_fields_renderers = {"data": "json", "query_params": "json"}
 
     def __init__(
@@ -40,7 +41,7 @@ class DreamhubApiOperator(BaseOperator):
         retry_writes: bool = False,
         dreamhub_conn_id: str = DreamhubHook.default_conn_name,
         # Airflow's own operator arguments (task_id, retries, ...), forwarded unchanged: they are
-        # BaseOperator's to type, and this is the one place `Any` remains.
+        # BaseOperator's to type, so this is the only `Any` in this operator.
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -52,11 +53,11 @@ class DreamhubApiOperator(BaseOperator):
         self.dreamhub_conn_id = dreamhub_conn_id
 
     def execute(self, context: Context) -> JsonValue:
-        path = self.endpoint.partition("?")[0].rstrip("/")
+        path = unquote(self.endpoint.partition("?")[0]).rstrip("/")
         if self.method in READ_METHODS or path.endswith(("/filter", "/fetch")):
             # Reads of activities are refused here as in the extract: the API returns rows beyond
             # the requested record. Activity writes are not affected.
-            DreamhubHook.check_readable(self.endpoint)
+            DreamhubHook.check_readable(path)
         hook = DreamhubHook(dreamhub_conn_id=self.dreamhub_conn_id)
         try:
             response = hook.request(

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Collection
 from typing import Any
 
 from dreamhub_airflow._compat import BaseOperator, Context
@@ -72,7 +71,8 @@ class DreamhubBulkOperator(BaseOperator):
     them again; for loads that may be retried, use ``upsert`` with ``match_field``.
     """
 
-    template_fields: Collection[str] = ("entity", "records", "input_path", "results_path")
+    # Unannotated: Airflow 2 and 3 declare this attribute with different types.
+    template_fields = ("entity", "records", "input_path", "results_path")
     ui_color = "#fdf2e8"
 
     def __init__(
@@ -92,7 +92,7 @@ class DreamhubBulkOperator(BaseOperator):
         dreamhub_conn_id: str = DreamhubHook.default_conn_name,
         storage_conn_id: str | None = None,
         # Airflow's own operator arguments (task_id, retries, ...), forwarded unchanged: they are
-        # BaseOperator's to type, and this is the one place `Any` remains.
+        # BaseOperator's to type, so this is the only `Any` in this operator.
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
