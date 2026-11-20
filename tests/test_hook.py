@@ -193,13 +193,15 @@ class TestRateLimitsAndRetries:
         assert route.call_count == 1
 
     @respx.mock
-    def test_errors_carry_the_api_detail_only(self, hook):
+    def test_errors_carry_the_api_detail_on_the_error_not_in_its_message(self, hook):
         respx.get(f"{BASE_URL}/deals/stages").mock(
             return_value=httpx.Response(403, json={"detail": "Missing required permissions: deals:read"})
         )
 
-        with pytest.raises(DreamhubApiError, match="HTTP 403: Missing required permissions"):
+        with pytest.raises(DreamhubApiError, match=r"HTTP 403$") as raised:
             hook.request("GET", "deals/stages")
+
+        assert raised.value.detail == "Missing required permissions: deals:read"
 
 
 class TestBulk:
@@ -282,7 +284,7 @@ class TestBulk:
         result = hook.bulk("companies", "create", [{"name": "A", "status": 1}, {"name": "Private Co"}])
 
         assert result.failures == [
-            {"key": 0, "error": "not written: another record in the same request is invalid"},
+            {"key": 0, "error": "not written: another record in the same batch is invalid"},
             {"key": 1, "error": "status: Field required"},
         ]
         assert result.succeeded_ids == []
@@ -305,20 +307,87 @@ class TestBulk:
         ]
 
     @respx.mock
-    def test_a_validation_error_names_the_field_but_not_the_value(self, hook):
-        respx.post(f"{BASE_URL}/deals/filter").mock(
+    def test_a_validation_error_message_names_fields_and_error_types_only(self, hook):
+        respx.post(f"{BASE_URL}/people/bulk/create").mock(
             return_value=httpx.Response(
                 422,
-                json={"detail": [{"loc": ["body", "sort", "field"], "msg": "Field required", "input": "secret"}]},
+                json={
+                    "detail": [
+                        {
+                            "type": "value_error",
+                            "loc": ["body", 0, "email"],
+                            "msg": "Value error, not an email address: alice@example.com",
+                            "input": "alice@example.com",
+                        },
+                        {"type": "missing", "loc": ["body", 0, "custom", "alice@example.com"], "msg": "Field required"},
+                    ]
+                },
+            )
+        )
+
+        with pytest.raises(DreamhubApiError) as raised:
+            hook.request("POST", "people/bulk/create", json=[{}])
+
+        message = str(raised.value)
+        assert message.endswith("failed with HTTP 422 (email: value_error; custom.?: missing)")
+        assert "alice" not in message
+        # The API's own words stay available to the caller, which reports them per record.
+        assert raised.value.item_errors[0].startswith("email: Value error")
+
+    @respx.mock
+    def test_free_text_from_the_api_is_kept_off_the_message(self, hook):
+        respx.post(f"{BASE_URL}/deals/filter").mock(
+            return_value=httpx.Response(400, json={"detail": "Bad request: no deal has email alice@example.com"})
+        )
+
+        with pytest.raises(DreamhubApiError) as raised:
+            hook.request("POST", "deals/filter", json={})
+
+        assert str(raised.value) == "Dreamhub API POST deals/filter failed with HTTP 400"
+        assert raised.value.detail == "Bad request: no deal has email alice@example.com"
+
+    @respx.mock
+    def test_a_malformed_validation_entry_still_raises_the_api_error(self, hook):
+        respx.post(f"{BASE_URL}/deals/filter").mock(
+            return_value=httpx.Response(
+                422, json={"detail": [{"loc": 5, "msg": "odd", "type": "missing"}, "not an entry", {"loc": []}]}
             )
         )
 
         with pytest.raises(DreamhubApiError) as raised:
             hook.request("POST", "deals/filter", json={})
 
-        assert raised.value.detail == "sort.field: Field required"
-        assert "secret" not in str(raised.value)
-        assert pickle.loads(pickle.dumps(raised.value)).detail == raised.value.detail
+        assert raised.value.summary == "missing"
+        assert raised.value.item_errors == {}
+
+    def test_the_api_error_survives_pickling_with_its_reasons(self):
+        error = DreamhubApiError(
+            "PUT", "deals/bulk/update", 422, "a: b", {1: "status: Field required"}, "status: missing"
+        )
+
+        copy = pickle.loads(pickle.dumps(error))
+
+        assert (copy.detail, copy.item_errors, copy.summary, str(copy)) == (
+            error.detail,
+            error.item_errors,
+            error.summary,
+            str(error),
+        )
+
+    @respx.mock
+    def test_a_refused_batch_with_no_reason_per_record_gives_every_record_the_apis_reason(self, hook):
+        respx.put(f"{BASE_URL}/deals/bulk/update").mock(
+            return_value=httpx.Response(
+                422, json={"detail": [{"type": "bool_parsing", "loc": ["query", "override"], "msg": "bad flag"}]}
+            )
+        )
+
+        result = hook.bulk("deals", "update", [{"id": "d-1"}, {"id": "d-2"}])
+
+        assert result.failures == [
+            {"key": "d-1", "error": "override: bad flag"},
+            {"key": "d-2", "error": "override: bad flag"},
+        ]
 
     @respx.mock
     def test_an_unexpected_server_error_still_fails_the_write(self, hook):

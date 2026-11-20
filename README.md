@@ -117,10 +117,11 @@ the record's Dreamhub id or its position (0-based) in your data, and the `error`
 with `match_existing=True` reports a new record Dreamhub could not create as `new record <n> of the batch
 starting at <position>`, because Dreamhub matched some records of that batch to existing ones first.
 
-The task log lists only the keys of failed records, never record values or per-record reasons, so data such
-as emails stays out of logs. Set `results_path` to keep the reasons when the task fails. The reasons are
-Dreamhub's own messages; a validation message can quote the value it rejected, so treat the results file, the
-task's return value and the traceback of a failed task like the data you load.
+The task log lists only the keys of failed records, never record values or per-record reasons, and an API
+error in the log names only the HTTP status and, for rejected input, the fields and error types. Data such as
+emails stays out of logs. Set `results_path` to keep the reasons when the task fails. The reasons are
+Dreamhub's own messages; a validation message can quote the value it rejected, so treat the results file and
+the task's return value like the data you load.
 
 Notes:
 
@@ -138,7 +139,8 @@ Notes:
 - `delete` is a soft delete, one request per record; `batch_size` and `override` do not apply to it.
 - When every record of a batch fails, Dreamhub reports one reason for the whole batch.
 - A batch that fails Dreamhub's input checks (for example a required field is missing) is not written at all:
-  each invalid record fails with the field and the reason, and the others of that batch fail as "not written".
+  each invalid record fails with the field and the reason, and the others of that batch fail with
+  `not written: another record in the same batch is invalid`.
 
 ## Other endpoints
 
@@ -180,6 +182,11 @@ See [`example_dags/`](example_dags):
 - Activities cannot be read yet, because the Dreamhub API has no read of activities by filter that is scoped
   correctly.
 - A bulk request carries at most 500 records; larger inputs are split automatically.
+- `update` and `upsert` currently need every field that creating the record requires (for companies, `name`
+  and `status`), even for records matched with `match_field`: Dreamhub checks each record of a bulk update as
+  a full record. A record sending only the fields to change fails with `<field>: Field required` and nothing is
+  written. This also applies to `example_dags/usage_to_dreamhub.py`. Partial updates will work once Dreamhub
+  accepts them in bulk; no provider change is needed then.
 
 ## Troubleshooting
 

@@ -7,6 +7,9 @@ The file is NDJSON, one row per account, for example::
 ``account_number`` must be a field on the Dreamhub company (a custom field works) holding the same value.
 The other keys are the Dreamhub fields to update. Rows whose key matches no company, or more than one,
 fail the task; their input positions are in the task log and, with their reasons, in the results file.
+
+Until Dreamhub accepts partial records in bulk updates, each row must also carry every field that creating a
+company requires (``name`` and ``status``); see "Limitations" in the README.
 """
 
 from __future__ import annotations

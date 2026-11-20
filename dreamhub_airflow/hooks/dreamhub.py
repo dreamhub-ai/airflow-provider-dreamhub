@@ -31,12 +31,19 @@ DEFAULT_MAX_RETRY_WAIT_SECONDS = 300.0
 # Longest wait between retries of a gateway error or a dropped connection.
 MAX_BACKOFF_SECONDS = 60.0
 RETRYABLE_STATUSES = frozenset({502, 503, 504})
+# Longest error text kept from one API answer.
+MAX_DETAIL_CHARS = 200
 BULK_OPERATIONS = ("create", "update", "upsert", "delete")
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 
 class DreamhubApiError(Exception):
-    """The API answered with an error the hook does not handle itself."""
+    """The API answered with an error the hook does not handle itself.
+
+    ``detail`` and ``item_errors`` are the API's own words and can quote a value it rejected,
+    so they are kept off the message, which ends up in task logs. The message carries only
+    ``summary``: the fields at fault and the type of each error.
+    """
 
     def __init__(
         self,
@@ -45,6 +52,7 @@ class DreamhubApiError(Exception):
         status_code: int,
         detail: str | None = None,
         item_errors: dict[int, str] | None = None,
+        summary: str | None = None,
     ) -> None:
         self.method = method
         self.path = path
@@ -52,11 +60,15 @@ class DreamhubApiError(Exception):
         self.detail = detail
         # For a request body that is a list: the reason the API gave for each item, by position.
         self.item_errors = item_errors or {}
+        self.summary = summary
         message = f"Dreamhub API {method} {path} failed with HTTP {status_code}"
-        super().__init__(f"{message}: {detail}" if detail else message)
+        super().__init__(f"{message} ({summary})" if summary else message)
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (type(self), (self.method, self.path, self.status_code, self.detail, self.item_errors))
+        return (
+            type(self),
+            (self.method, self.path, self.status_code, self.detail, self.item_errors, self.summary),
+        )
 
 
 class DreamhubConsistencyError(Exception):
@@ -278,7 +290,7 @@ class DreamhubHook(BaseHook):
             if status == 404 and allow_not_found:
                 return response
             if status >= 400:
-                raise DreamhubApiError(method, url, status, _short_detail(response), _item_errors(response))
+                raise DreamhubApiError(method, url, status, **_ErrorBody.read(response).as_error_fields())
             return response
 
     def _wait(self, seconds: float, method: str, path: str, reason: str) -> None:
@@ -553,7 +565,7 @@ class DreamhubHook(BaseHook):
                     if item in error.item_errors:
                         reason = error.item_errors[item]
                     elif error.item_errors:
-                        reason = "not written: another record in the same request is invalid"
+                        reason = "not written: another record in the same batch is invalid"
                     else:
                         reason = error.detail or "HTTP 422"
                     result.failures.append({"key": BulkResult.record_key(record, offset + position), "error": reason})
@@ -694,7 +706,9 @@ def _rows(payload: Any, items_key: str) -> list[dict[str, Any]]:
         rows = payload.get(key)
         if isinstance(rows, list):
             return rows
-    raise DreamhubApiError("POST", items_key, 200, "response has no list of records")
+    raise DreamhubApiError(
+        "POST", items_key, 200, "response has no list of records", summary="response has no list of records"
+    )
 
 
 def _camel(name: str) -> str:
@@ -715,49 +729,85 @@ def _field_value(row: dict[str, Any], name: str) -> Any:
     return None
 
 
-def _short_detail(response: httpx.Response) -> str | None:
-    """The API's own short error text, never the request or a full body."""
-    try:
-        detail = response.json().get("detail")
-    except (ValueError, AttributeError):
-        return None
-    if isinstance(detail, str):
-        return detail[:200]
-    reasons = list(dict.fromkeys(reason for _, reason in _validation_errors(detail)))
-    return "; ".join(reasons)[:200] or None
+@dataclass(frozen=True)
+class _ValidationEntry:
+    """One entry of a request-validation error, as the API listed it."""
 
+    # Position of the item in a list body, when the entry is about one.
+    item: int | None
+    # The API's message about the field. It can quote the value it rejected.
+    reason: str
+    # The field and the error type only, safe to put in a log.
+    summary: str
 
-def _item_errors(response: httpx.Response) -> dict[int, str]:
-    """The API's validation reasons for a list body, by the position of the item they concern."""
-    try:
-        detail = response.json().get("detail")
-    except (ValueError, AttributeError):
-        return {}
-    by_item: dict[int, list[str]] = {}
-    for item, reason in _validation_errors(detail):
-        if item is not None:
-            by_item.setdefault(item, []).append(reason)
-    return {item: "; ".join(reasons)[:200] for item, reasons in by_item.items()}
+    _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
+    @classmethod
+    def parse(cls, entry: Any) -> _ValidationEntry | None:
+        """The entry, or ``None`` when it is not shaped like a validation error.
 
-def _validation_errors(detail: Any) -> list[tuple[int | None, str]]:
-    """``(item position, "field: message")`` for each entry of a request-validation error.
-
-    Only the field and the message are kept: the entry's ``input`` holds the rejected value,
-    which can be personal data, so it is never read.
-    """
-    if not isinstance(detail, list):
-        return []
-    errors = []
-    for entry in detail:
+        The entry's ``input`` holds the rejected value and is never read. A location part that
+        is not a plain name (a key taken from the data, for example) is shown as ``?``.
+        """
         if not isinstance(entry, dict) or not isinstance(entry.get("msg"), str):
-            continue
-        loc = list(entry.get("loc") or [])
-        if loc and loc[0] == "body":
-            loc = loc[1:]
+            return None
+        loc = entry.get("loc")
+        parts = list(loc) if isinstance(loc, list) else []
+        if parts and parts[0] in ("body", "query", "path", "header", "cookie"):
+            parts = parts[1:]
         item = None
-        if loc and isinstance(loc[0], int) and not isinstance(loc[0], bool):
-            item, loc = loc[0], loc[1:]
-        field = ".".join(str(part) for part in loc)
-        errors.append((item, f"{field}: {entry['msg']}" if field else entry["msg"]))
-    return errors
+        if parts and isinstance(parts[0], int) and not isinstance(parts[0], bool):
+            item, parts = parts[0], parts[1:]
+        field = ".".join(cls._safe_part(part) for part in parts)
+        kind = entry.get("type")
+        kind = kind if isinstance(kind, str) and cls._NAME.fullmatch(kind) else "invalid"
+        return cls(
+            item=item,
+            reason=f"{field}: {entry['msg']}" if field else entry["msg"],
+            summary=f"{field}: {kind}" if field else kind,
+        )
+
+    @classmethod
+    def _safe_part(cls, part: Any) -> str:
+        if isinstance(part, int) and not isinstance(part, bool):
+            return str(part)
+        return part if isinstance(part, str) and cls._NAME.fullmatch(part) else "?"
+
+
+@dataclass(frozen=True)
+class _ErrorBody:
+    """What an error response says, read once: the API's text, its per-item reasons and a summary safe to log."""
+
+    detail: str | None = None
+    item_errors: dict[int, str] = field(default_factory=dict)
+    summary: str | None = None
+
+    @classmethod
+    def read(cls, response: httpx.Response) -> _ErrorBody:
+        try:
+            detail = response.json().get("detail")
+        except (ValueError, AttributeError):
+            return cls()
+        if isinstance(detail, str):
+            # Free text written by the API: kept for the caller, never put in the message.
+            return cls(detail=detail[:MAX_DETAIL_CHARS])
+        if not isinstance(detail, list):
+            return cls()
+        entries = [parsed for parsed in map(_ValidationEntry.parse, detail) if parsed is not None]
+        by_item: dict[int, list[str]] = {}
+        for entry in entries:
+            if entry.item is not None:
+                by_item.setdefault(entry.item, []).append(entry.reason)
+        return cls(
+            detail=_joined(entry.reason for entry in entries),
+            item_errors={item: "; ".join(reasons)[:MAX_DETAIL_CHARS] for item, reasons in by_item.items()},
+            summary=_joined(entry.summary for entry in entries),
+        )
+
+    def as_error_fields(self) -> dict[str, Any]:
+        return {"detail": self.detail, "item_errors": self.item_errors, "summary": self.summary}
+
+
+def _joined(texts: Iterable[str]) -> str | None:
+    """Distinct texts in order, joined and cut to the detail limit; ``None`` when there are none."""
+    return "; ".join(dict.fromkeys(texts))[:MAX_DETAIL_CHARS] or None
