@@ -31,6 +31,8 @@ DEFAULT_MAX_RETRY_WAIT_SECONDS = 300.0
 # Longest wait between retries of a gateway error or a dropped connection.
 MAX_BACKOFF_SECONDS = 60.0
 RETRYABLE_STATUSES = frozenset({502, 503, 504})
+# The API's answer for a path it does not serve, as opposed to "No <entity> found".
+_UNKNOWN_ROUTE_DETAIL = "Not Found"
 # Longest error text kept from one API answer.
 MAX_DETAIL_CHARS = 200
 BULK_OPERATIONS = ("create", "update", "upsert", "delete")
@@ -290,7 +292,9 @@ class DreamhubHook(BaseHook):
                 continue
             if status == 404 and allow_not_found:
                 return response
-            if status >= 400:
+            if status >= 300:
+                # Redirects are not followed (the token stays with the configured API), so an
+                # answer that is not a success is an error, a redirect included.
                 raise DreamhubApiError(method, url, status, **_ErrorBody.read(response).as_error_fields())
             return response
 
@@ -304,21 +308,22 @@ class DreamhubHook(BaseHook):
 
     def _retry_after(self, response: httpx.Response, attempt: int) -> float:
         """The server's ``Retry-After`` (seconds or an HTTP date), capped; our own backoff when absent or unreadable."""
+        fallback = min(self._backoff(attempt), self._max_retry_wait)
         value = response.headers.get("Retry-After")
         if not value:
-            return self._backoff(attempt)
+            return fallback
         try:
             seconds = float(value)
         except ValueError:
             try:
                 parsed = email.utils.parsedate_to_datetime(value)
             except (TypeError, ValueError):
-                return self._backoff(attempt)
+                return fallback
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             seconds = (parsed - datetime.now(timezone.utc)).total_seconds()
         if math.isnan(seconds):
-            return self._backoff(attempt)
+            return fallback
         return min(max(seconds, 0.0), self._max_retry_wait)
 
     # ------------------------------------------------------------------ reads
@@ -354,6 +359,7 @@ class DreamhubHook(BaseHook):
         seen: set[str] = set()
         without_id = 0
         totals: set[int] = set()
+        pages_read: set[int] = set()
         page = 1
         while True:
             response = self.request(
@@ -366,12 +372,21 @@ class DreamhubHook(BaseHook):
             )
             if response.status_code == 404:
                 # The API answers "nothing matches" with 404. On a later page it only means
-                # there is nothing more; the count check below still catches a short read.
+                # there is nothing more; the count check below still catches a short read. A 404
+                # for a path the API does not serve at all is a wrong entity, not an empty result.
+                if _ErrorBody.read(response).detail == _UNKNOWN_ROUTE_DETAIL:
+                    raise DreamhubApiError("POST", f"{route.path}/filter", 404, summary="no such route")
                 if page == 1:
                     totals.add(0)
                 break
             payload = response.json()
             rows = _rows(payload, route.items_key)
+            # A page identical to one already read means the server ignores the page number;
+            # records without an id cannot be told apart otherwise, so stop instead of reading on.
+            fingerprint = hash(repr(rows))
+            if fingerprint in pages_read:
+                break
+            pages_read.add(fingerprint)
             # A bare list carries no total or page count: such a read is not count-checked.
             meta = payload if isinstance(payload, dict) else {}
             total = meta.get("total")
@@ -431,7 +446,7 @@ class DreamhubHook(BaseHook):
         keys = list(wanted)
         for start in range(0, len(keys), MAX_PAGE_SIZE):
             chunk = [wanted[key] for key in keys[start : start + MAX_PAGE_SIZE]]
-            for row in self.iter_records(entity, {match_field: chunk}):
+            for row in self.iter_records(entity, {match_field: chunk}, include_additionals=True):
                 key = self.match_key(_field_value(row, match_field))
                 if key in found:
                     found[key].append(str(row["id"]))
@@ -465,11 +480,16 @@ class DreamhubHook(BaseHook):
         return bool(value) and value != "None" and bool(str(value).strip())
 
     @staticmethod
-    def _route(entity: str) -> EntityRoute:
-        if "activities" in unquote(entity).strip("/").split("/"):
+    def check_readable(path: str) -> None:
+        """Refuse a read of activities: the API has no correctly scoped read of them yet."""
+        if "activities" in unquote(path).strip("/").split("/"):
             raise ValueError(
                 "activities cannot be read yet: the API has no correctly scoped read of activities by filter"
             )
+
+    @classmethod
+    def _route(cls, entity: str) -> EntityRoute:
+        cls.check_readable(entity)
         return EntityRoute.for_entity(entity)
 
     # ------------------------------------------------------------------ writes
@@ -517,7 +537,12 @@ class DreamhubHook(BaseHook):
                 )
             except BaseException as error:
                 end = start + len(batch)
-                DreamhubBulkError(result, list(range(start, end)), list(range(end, len(records))), error).propagate()
+                unknown = getattr(error, "positions", None)
+                if unknown is None:
+                    # Records held back before sending already have their outcome reported.
+                    reported = {f["key"] for f in result.failures if isinstance(f["key"], int)}
+                    unknown = [p for p in range(start, end) if p not in reported]
+                DreamhubBulkError(result, unknown, list(range(end, len(records))), error).propagate()
         return result
 
     def _write_batch(
@@ -582,7 +607,36 @@ class DreamhubHook(BaseHook):
             result.failures.append({"key": input_key, "error": str(message)})
         for failed_id in payload.get("failedIds") or []:
             if str(failed_id) not in reported:
+                reported.add(str(failed_id))
                 result.failures.append({"key": str(failed_id), "error": "failed"})
+        self._check_every_record_reported(payload, sent, positions, offset, reported, result)
+
+    @staticmethod
+    def _check_every_record_reported(
+        payload: dict[str, Any],
+        sent: list[dict[str, Any]],
+        positions: list[int],
+        offset: int,
+        reported: set[str],
+        result: BulkResult,
+    ) -> None:
+        """A record the response neither confirms nor reports as failed has an unknown outcome."""
+        succeeded = {str(i) for i in payload.get("successfulIds") or []}
+        if len(succeeded) + len(reported) >= len(sent):
+            return
+        unknown: list[int] = []
+        for position, record in zip(positions, sent, strict=True):
+            key = str(BulkResult.record_key(record, offset + position))
+            if key in succeeded or key in reported:
+                continue
+            if DreamhubHook._has_id(record):
+                result.failures.append({"key": key, "error": "not reported by Dreamhub"})
+            else:
+                unknown.append(offset + position)
+        # A new record's id is only known once it exists, so how many of the unreported new records
+        # were written cannot be told: stop with them as unknown rather than guess.
+        if unknown:
+            raise _UnreportedRecords(unknown)
 
     def _delete_each(self, route: EntityRoute, records: Sequence[dict[str, Any]], result: BulkResult) -> None:
         for position, record in enumerate(records):
@@ -598,6 +652,9 @@ class DreamhubHook(BaseHook):
             try:
                 self.request("DELETE", path)
             except DreamhubApiError as error:
+                if error.status_code in RETRYABLE_STATUSES:
+                    # A gateway error does not say whether the delete was applied.
+                    DreamhubBulkError(result, [position], list(range(position + 1, len(records))), error).propagate()
                 if error.status_code == 401:
                     # The token was refused: every later record would fail the same way.
                     result.failures.append({"key": key, "error": error.detail or "HTTP 401"})
@@ -607,6 +664,14 @@ class DreamhubHook(BaseHook):
             except BaseException as error:
                 DreamhubBulkError(result, [position], list(range(position + 1, len(records))), error).propagate()
             result.succeeded_ids.append(key)
+
+
+class _UnreportedRecords(Exception):
+    """A bulk response left some new records unreported; ``positions`` are their input positions."""
+
+    def __init__(self, positions: list[int]) -> None:
+        super().__init__(f"{len(positions)} new records were neither confirmed nor reported as failed")
+        self.positions = positions
 
 
 class _BatchKeys:

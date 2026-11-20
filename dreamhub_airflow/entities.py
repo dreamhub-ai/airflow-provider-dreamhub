@@ -16,12 +16,12 @@ class EntityRoute:
     @classmethod
     def for_entity(cls, entity: str) -> EntityRoute:
         """The route for a known entity, or one derived from a path such as ``partners``."""
-        known = KNOWN_ENTITIES.get(entity)
-        if known is not None:
-            return known
         path = entity.strip("/")
         if not path:
             raise ValueError("entity must not be empty")
+        known = KNOWN_ENTITIES.get(path)
+        if known is not None:
+            return known
         return cls(name=entity, path=path, items_key=path.rsplit("/", 1)[-1])
 
 

@@ -9,6 +9,7 @@ import httpx
 import pytest
 import respx
 
+from dreamhub_airflow.hooks import dreamhub
 from dreamhub_airflow.hooks.dreamhub import (
     MAX_BULK_BATCH,
     DreamhubApiError,
@@ -136,8 +137,16 @@ class TestRateLimitsAndRetries:
         assert sleeps == [7.0]
 
     @respx.mock
-    def test_reads_an_http_date_retry_after(self, hook, sleeps):
-        later = datetime.now(timezone.utc) + timedelta(seconds=20)
+    def test_reads_an_http_date_retry_after(self, hook, sleeps, monkeypatch):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        class FrozenClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(dreamhub, "datetime", FrozenClock)
+        later = now + timedelta(seconds=20)
         respx.post(f"{BASE_URL}/companies/filter").mock(
             side_effect=[
                 httpx.Response(429, headers={"Retry-After": format_datetime(later, usegmt=True)}),
@@ -147,7 +156,7 @@ class TestRateLimitsAndRetries:
 
         hook.get_records("companies")
 
-        assert len(sleeps) == 1 and 10 <= sleeps[0] <= 20
+        assert sleeps == [20.0]
 
     @respx.mock
     def test_never_waits_longer_than_the_cap(self, hook, sleeps):

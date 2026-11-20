@@ -83,7 +83,9 @@ through XCom.
 **Completeness.** A read fails instead of producing a partial file: if the number of records the API reports
 changes during the read, or the rows read do not add up to it, the task raises `DreamhubConsistencyError` and
 leaves `output_path` as it was. Run the task again; to have Airflow do that for you, set `retries` on the task
-or in the DAG's `default_args` (the examples use `{"retries": 2}`).
+or in the DAG's `default_args` (the examples use `{"retries": 2}`). The check compares counts: a record added
+and another removed between two page requests leave the count unchanged, so the read cannot see that pair.
+Extract a table that changes while it is read at a quiet time, or read it twice and compare.
 
 ## Load in bulk
 
@@ -117,11 +119,13 @@ the record's Dreamhub id or its position (0-based) in your data, and the `error`
 with `match_existing=True` reports a new record Dreamhub could not create as `new record <n> of the batch
 starting at <position>`, because Dreamhub matched some records of that batch to existing ones first.
 
-The task log lists only the keys of failed records, never record values or per-record reasons, and an API
-error in the log names only the HTTP status and, for rejected input, the fields and error types. Data such as
-emails stays out of logs. Set `results_path` to keep the reasons when the task fails. The reasons are
-Dreamhub's own messages; a validation message can quote the value it rejected, so treat the results file and
-the task's return value like the data you load.
+The task log lists only the keys of failed records and never per-record reasons, and an API error in the
+log names only the HTTP status and, for rejected input, the fields and error types. A key is the `id` from your
+input when the record has one, logged as written: if your ids could hold personal data, protect the task logs
+like that data. Set `results_path` to keep the reasons when the task fails; with `fail_on_partial=True` the
+raised `DreamhubRecordsFailedError` also carries the full result as `summary` (for an `on_failure_callback`).
+The reasons are Dreamhub's own messages; a validation message can quote the value it rejected, so treat the
+results file, the task's return value and that `summary` like the data you load.
 
 Notes:
 
@@ -129,10 +133,11 @@ Notes:
   writes every non-null value you send.
 - A request that may already have been applied is never resent automatically. If the run stops part-way,
   what was written and what failed before it stopped is logged and written to `results_path`, together with
-  `unknown_positions` (the batch in flight, which may or may not have been written) and
-  `not_attempted_positions`, all as positions in your data. An error stops the task with `DreamhubBulkError`;
+  `unknown_positions` (records sent in the request in flight, which may or may not have been written) and
+  `not_attempted_positions`, all as positions in your data; the task log lists both sets of positions too. An error stops the task with `DreamhubBulkError`;
   if Airflow stops the task (a timeout or a kill), its own exception is kept and the same report is written.
-- A refused API token (HTTP 401) stops a `delete` at the first record; other errors fail just that record.
+- A refused API token (HTTP 401) stops a `delete` at the first record, and so does a gateway error (502, 503,
+  504), whose record is then reported as unknown; other errors fail just that record.
 - Records written before a task fails stay written. Running a `create` again creates them again, so for loads
   that may be retried, use `upsert` with `match_field`: a second run updates the records the first run made.
 - The task returns at most 100 failures and 1,000 ids; set `results_path` to keep the complete result.
@@ -163,7 +168,8 @@ hook = DreamhubHook()
 try:
     for company in hook.iter_records("companies", {"status": 1}):
         ...
-    result = hook.bulk("companies", "update", [{"id": "...", "seats": 10}])
+    # Today's bulk update needs every field a new company requires (see Limitations).
+    result = hook.bulk("companies", "update", [{"id": "...", "name": "Acme", "status": 1, "seats": 10}])
 finally:
     hook.close()
 ```

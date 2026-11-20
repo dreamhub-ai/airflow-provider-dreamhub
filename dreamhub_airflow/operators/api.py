@@ -49,6 +49,10 @@ class DreamhubApiOperator(BaseOperator):
         self.dreamhub_conn_id = dreamhub_conn_id
 
     def execute(self, context: Any) -> Any:
+        if self.method in READ_METHODS or self.endpoint.rstrip("/").endswith(("/filter", "/fetch")):
+            # Reads of activities are refused here as in the extract: the API returns rows beyond
+            # the requested record. Activity writes are not affected.
+            DreamhubHook.check_readable(self.endpoint)
         hook = DreamhubHook(dreamhub_conn_id=self.dreamhub_conn_id)
         try:
             response = hook.request(

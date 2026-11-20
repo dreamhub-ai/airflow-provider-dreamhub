@@ -131,13 +131,21 @@ class TestUpsertByMatchField:
 class TestReturnValueSize:
     @respx.mock
     def test_the_returned_ids_are_capped_and_the_counts_are_not(self) -> None:
-        ids = [f"c-{i}" for i in range(MAX_IDS_IN_XCOM + 5)]
-        respx.post(f"{BASE_URL}/companies/bulk/create").mock(
-            return_value=httpx.Response(201, json={"successfulIds": ids, "errors": {}})
-        )
+        total = MAX_IDS_IN_XCOM + 5
+        created = iter(range(total))
+
+        def create(request: httpx.Request) -> httpx.Response:
+            batch = json.loads(request.content)
+            return httpx.Response(201, json={"successfulIds": [f"c-{next(created)}" for _ in batch], "errors": {}})
+
+        respx.post(f"{BASE_URL}/companies/bulk/create").mock(side_effect=create)
 
         summary = DreamhubBulkOperator(
-            task_id="load", entity="companies", operation="create", records=[{"name": "x"}], batch_size=1
+            task_id="load",
+            entity="companies",
+            operation="create",
+            records=[{"name": f"Company {i}", "status": 1} for i in range(total)],
+            batch_size=500,
         ).execute({})
 
         assert summary["succeeded"] == MAX_IDS_IN_XCOM + 5

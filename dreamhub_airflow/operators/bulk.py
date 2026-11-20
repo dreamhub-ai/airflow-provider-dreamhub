@@ -23,7 +23,19 @@ MAX_IDS_IN_XCOM = 1000
 
 
 class DreamhubRecordsFailedError(Exception):
-    """Some records were not written and the operator was asked to fail on that."""
+    """Some records were not written and the operator was asked to fail on that.
+
+    ``summary`` is the task's full result (every failure and its reason, in input positions), the
+    value the task would have returned. The reasons are Dreamhub's own messages, so they are kept
+    off the message, which ends up in the task log.
+    """
+
+    def __init__(self, message: str, summary: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.summary = summary or {}
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (type(self), (str(self), self.summary))
 
 
 class DreamhubBulkOperator(BaseOperator):
@@ -133,6 +145,9 @@ class DreamhubBulkOperator(BaseOperator):
                 [positions[i] for i in partial.not_attempted],
                 partial.cause,
             )
+            if partial is not error:
+                # Airflow's own exception carries the report in the caller's positions too.
+                error.dreamhub_partial = stopped  # type: ignore[attr-defined]
             try:
                 self._finish(stopped.result, unknown=stopped.unknown, not_attempted=stopped.not_attempted)
             except Exception:
@@ -227,6 +242,13 @@ class DreamhubBulkOperator(BaseOperator):
         )
         if result.failures:
             self.log.warning("Failed records (Dreamhub id or input position): %s", [f["key"] for f in result.failures])
+        if unknown is not None:
+            # Positions only, never values: what a rerun must check before writing again.
+            self.log.warning(
+                "Run stopped. Input positions that may or may not have been written: %s; not attempted: %s",
+                unknown,
+                not_attempted or [],
+            )
         return summary
 
     def _report(self, result: BulkResult) -> dict[str, Any]:
@@ -234,7 +256,7 @@ class DreamhubBulkOperator(BaseOperator):
         if result.failed and self.fail_on_partial:
             where = f"see {self.results_path} and the task log" if self.results_path else "see the task log"
             raise DreamhubRecordsFailedError(
-                f"{result.failed} of {result.succeeded + result.failed} records failed; {where}"
+                f"{result.failed} of {result.succeeded + result.failed} records failed; {where}", summary
             )
         summary["failures"] = summary["failures"][:MAX_FAILURES_IN_XCOM]
         summary["succeeded_ids"] = summary["succeeded_ids"][:MAX_IDS_IN_XCOM]

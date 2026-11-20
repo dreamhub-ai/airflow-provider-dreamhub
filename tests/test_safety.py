@@ -373,7 +373,10 @@ class TestARunThatStopsPartWay:
         def timeout(request: httpx.Request) -> httpx.Response:
             raise AirflowTaskTimeout("execution_timeout reached")
 
+        attempts: list[object] = []
+
         def unwritable(self: object, rows: object) -> None:
+            attempts.append(rows)
             raise OSError("disk full")
 
         respx.post(f"{BASE_URL}/companies/bulk/create").mock(side_effect=timeout)
@@ -387,6 +390,8 @@ class TestARunThatStopsPartWay:
                 records=[{"name": "A"}],
                 results_path=str(tmp_path / "results.ndjson"),
             ).execute({})
+
+        assert len(attempts) == 1
 
     def test_a_new_record_key_reads_back_as_its_number_and_position(self) -> None:
         assert BulkResult.parse_new_record_key(BulkResult.new_record_key(3, 200)) == (3, 200)

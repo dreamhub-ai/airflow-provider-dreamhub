@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import importlib
 import json
 from importlib.metadata import entry_points
 
@@ -9,6 +10,7 @@ import pytest
 import respx
 
 from dreamhub_airflow.get_provider_info import get_provider_info
+from dreamhub_airflow.hooks.dreamhub import DreamhubHook
 from dreamhub_airflow.operators.api import DreamhubApiOperator
 from dreamhub_airflow.operators.bulk import DreamhubBulkOperator, DreamhubRecordsFailedError
 from dreamhub_airflow.operators.extract import DreamhubExtractOperator
@@ -156,13 +158,15 @@ class TestBulk:
             match_field="external_key",
             fail_on_partial=False,
             records=[
-                {"external_key": "A", "seats": 10},
-                {"external_key": "B", "seats": 3},
-                {"external_key": "Z", "seats": 1},
+                {"external_key": "A", "name": "Acme", "status": 1, "seats": 10},
+                {"external_key": "B", "name": "Beta", "status": 1, "seats": 3},
+                {"external_key": "Z", "name": "Zeta", "status": 1, "seats": 1},
             ],
         ).execute({})
 
-        assert json.loads(update.calls[0].request.content) == [{"external_key": "A", "seats": 10, "id": "c-1"}]
+        assert json.loads(update.calls[0].request.content) == [
+            {"external_key": "A", "name": "Acme", "status": 1, "seats": 10, "id": "c-1"}
+        ]
         assert summary["failures"] == [
             {"key": 1, "error": "2 records have this external_key value"},
             {"key": 2, "error": "no record has this external_key value"},
@@ -250,3 +254,5 @@ class TestProviderRegistration:
         info = found[0].load()()
         assert info == get_provider_info()
         assert info["connection-types"][0]["connection-type"] == "dreamhub"
+        module, _, name = info["connection-types"][0]["hook-class-name"].rpartition(".")
+        assert getattr(importlib.import_module(module), name) is DreamhubHook

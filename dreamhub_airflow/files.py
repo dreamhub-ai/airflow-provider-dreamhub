@@ -16,6 +16,9 @@ from dreamhub_airflow._compat import ObjectStoragePath
 
 FILE_FORMATS = ("ndjson", "csv")
 _COPY_CHUNK = 1 << 20
+# The process umask, read once at import: a new local file gets the mode a plain open would give it.
+_UMASK = os.umask(0)
+os.umask(_UMASK)
 # Spreadsheet applications run a cell starting with one of these as a formula.
 FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
@@ -62,13 +65,13 @@ class RecordFile:
         os.makedirs(directory, exist_ok=True)
         existing_mode = _regular_file_mode(target)
         staged = os.path.join(directory, f".dreamhub-{secrets.token_hex(8)}.partial")
-        # O_EXCL never opens an existing file; the kernel applies the umask to 0o666 for a new one.
-        handle = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        # O_EXCL never opens an existing file. The staged file is readable only by its owner while
+        # records are written to it; it takes its final mode just before it replaces the target.
+        handle = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             with os.fdopen(handle, "w", encoding="utf-8", newline="") as staged_file:
                 count = self._write_records(staged_file, records, fields, neutralize_formulas)
-            if existing_mode is not None:
-                os.chmod(staged, existing_mode)
+            os.chmod(staged, existing_mode if existing_mode is not None else 0o666 & ~_UMASK)
             os.replace(staged, target)
         except BaseException:
             with contextlib.suppress(FileNotFoundError):
