@@ -58,6 +58,7 @@ class DreamhubApiError(Exception):
         detail: str | None = None,
         item_errors: dict[int, str] | None = None,
         summary: str | None = None,
+        after_ambiguous_attempt: bool = False,
     ) -> None:
         self.method = method
         self.path = path
@@ -66,13 +67,24 @@ class DreamhubApiError(Exception):
         # For a request body that is a list: the reason the API gave for each item, by position.
         self.item_errors = item_errors or {}
         self.summary = summary
+        # An earlier attempt of the same request may have been applied (its connection dropped, or
+        # a gateway answered), so this final answer does not settle whether the request took effect.
+        self.after_ambiguous_attempt = after_ambiguous_attempt
         message = f"Dreamhub API {method} {path} failed with HTTP {status_code}"
         super().__init__(f"{message} ({summary})" if summary else message)
 
     def __reduce__(self) -> tuple[object, ...]:
         return (
             type(self),
-            (self.method, self.path, self.status_code, self.detail, self.item_errors, self.summary),
+            (
+                self.method,
+                self.path,
+                self.status_code,
+                self.detail,
+                self.item_errors,
+                self.summary,
+                self.after_ambiguous_attempt,
+            ),
         )
 
 
@@ -276,12 +288,15 @@ class DreamhubHook(BaseHook):
         url = _relative_path(path)
         client = self.get_conn()
         attempt = 0
+        ambiguous = False
         while True:
             try:
                 response = client.request(method, url, params=params, json=json)
             except httpx.TransportError as error:
                 safe_to_resend = retry or isinstance(error, httpx.ConnectError)
                 if safe_to_resend and attempt < self._max_retries:
+                    # A connection that could not be opened sent nothing; any other may have been applied.
+                    ambiguous = ambiguous or not isinstance(error, httpx.ConnectError)
                     attempt += 1
                     self._wait(self._backoff(attempt), method, url, type(error).__name__)
                     continue
@@ -292,6 +307,7 @@ class DreamhubHook(BaseHook):
                 self._wait(self._retry_after(response, attempt), method, url, "rate limited")
                 continue
             if retry and status in RETRYABLE_STATUSES and attempt < self._max_retries:
+                ambiguous = True
                 attempt += 1
                 self._wait(self._backoff(attempt), method, url, f"HTTP {status}")
                 continue
@@ -301,7 +317,9 @@ class DreamhubHook(BaseHook):
                 # Redirects are not followed (the token stays with the configured API), so an
                 # answer that is not a success is an error, a redirect included.
                 body = _ErrorBody.read(response)
-                raise DreamhubApiError(method, url, status, body.detail, body.item_errors, body.summary)
+                raise DreamhubApiError(
+                    method, url, status, body.detail, body.item_errors, body.summary, after_ambiguous_attempt=ambiguous
+                )
             return response
 
     def _wait(self, seconds: float, method: str, path: str, reason: str) -> None:
@@ -687,8 +705,9 @@ class DreamhubHook(BaseHook):
                 # A delete of a record already deleted succeeds, so resending after a gateway error is safe.
                 self.request("DELETE", path, retry=True)
             except DreamhubApiError as error:
-                if error.status_code in RETRYABLE_STATUSES:
-                    # Still failing after the retries: whether the delete was applied is unknown.
+                if error.status_code in RETRYABLE_STATUSES or error.after_ambiguous_attempt:
+                    # Still failing after the retries, or an earlier attempt may have deleted it:
+                    # whether the delete was applied is unknown.
                     DreamhubBulkError(result, [position], list(range(position + 1, len(records))), error).propagate()
                 if error.status_code in (401, 429):
                     # The token was refused, or the rate limit outlasted the retries: every later

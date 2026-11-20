@@ -137,7 +137,8 @@ Notes:
   `not_attempted_positions`, all as positions in your data; the task log lists both sets of positions too. An error stops the task with `DreamhubBulkError`;
   if Airflow stops the task (a timeout or a kill), its own exception is kept and the same report is written.
 - A refused API token (HTTP 401), or a rate limit that outlasts the retries (HTTP 429), stops a `delete` at
-  that record; the rest are reported as not attempted. A gateway error (502, 503, 504) is
+  that record; the rest are reported as not attempted. If an earlier attempt of that delete may already have
+  been applied (its connection dropped or a gateway answered), the record is reported as unknown, not failed. A gateway error (502, 503, 504) is
   retried, since deleting a record twice is harmless; if it persists, the run stops with that record reported
   as unknown. Other errors fail just that record.
 - Records written before a task fails stay written. Running a `create` again creates them again, so for loads

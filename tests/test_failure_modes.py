@@ -371,3 +371,24 @@ class TestShapes:
 
         assert not target.is_symlink()
         assert elsewhere.read_text() == "keep\n"
+
+    @respx.mock
+    def test_a_delete_refused_after_an_attempt_that_may_have_applied_is_unknown(self, hook: DreamhubHook) -> None:
+        def dropped_then_limited(request: httpx.Request) -> httpx.Response:
+            if not getattr(dropped_then_limited, "dropped", False):
+                dropped_then_limited.dropped = True  # type: ignore[attr-defined]
+                raise httpx.ReadTimeout("no answer", request=request)
+            return httpx.Response(429)
+
+        respx.delete(f"{BASE_URL}/companies/c-1").mock(side_effect=dropped_then_limited)
+
+        with pytest.raises(DreamhubBulkError) as raised:
+            hook.bulk("companies", "delete", [{"id": "c-1"}, {"id": "c-2"}])
+
+        assert (raised.value.unknown, raised.value.not_attempted) == ([0], [1])
+        assert raised.value.result.failures == []
+
+    def test_the_ambiguity_of_an_api_error_survives_pickling(self) -> None:
+        error = DreamhubApiError("DELETE", "companies/c-1", 429, after_ambiguous_attempt=True)
+
+        assert pickle.loads(pickle.dumps(error)).after_ambiguous_attempt is True
