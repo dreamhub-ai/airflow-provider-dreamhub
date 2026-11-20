@@ -563,8 +563,8 @@ class DreamhubHook(BaseHook):
                     unknown = error.positions
                 else:
                     # Records held back before sending already have their outcome reported.
-                    reported = {f["key"] for f in result.failures if isinstance(f["key"], int)}
-                    unknown = [p for p in range(start, end) if p not in reported]
+                    reported = {failure["key"] for failure in result.failures if isinstance(failure["key"], int)}
+                    unknown = [position for position in range(start, end) if position not in reported]
                 DreamhubBulkError(result, unknown, list(range(end, len(records))), error).propagate()
         return result
 
@@ -690,9 +690,10 @@ class DreamhubHook(BaseHook):
                 if error.status_code in RETRYABLE_STATUSES:
                     # Still failing after the retries: whether the delete was applied is unknown.
                     DreamhubBulkError(result, [position], list(range(position + 1, len(records))), error).propagate()
-                if error.status_code == 401:
-                    # The token was refused: every later record would fail the same way.
-                    result.failures.append({"key": key, "error": error.detail or "HTTP 401"})
+                if error.status_code in (401, 429):
+                    # The token was refused, or the rate limit outlasted the retries: every later
+                    # record would fail the same way (after the same waits), so stop here.
+                    result.failures.append({"key": key, "error": error.detail or f"HTTP {error.status_code}"})
                     DreamhubBulkError(result, [], list(range(position + 1, len(records))), error).propagate()
                 result.failures.append({"key": key, "error": error.detail or f"HTTP {error.status_code}"})
                 continue
@@ -776,7 +777,7 @@ def _count_with_positions(positions: list[int]) -> str:
     if positions == list(range(positions[0], positions[-1] + 1)):
         where = str(positions[0]) if len(positions) == 1 else f"{positions[0]} to {positions[-1]}"
     else:
-        where = ", ".join(str(p) for p in positions[:20]) + (", ..." if len(positions) > 20 else "")
+        where = ", ".join(str(position) for position in positions[:20]) + (", ..." if len(positions) > 20 else "")
     return f"{len(positions)} records (input positions {where})"
 
 

@@ -168,7 +168,12 @@ class DreamhubBulkOperator(BaseOperator):
             if self.input_path is None:  # __init__ requires one of the two
                 raise ValueError("pass records or input_path")
             source = RecordFile(self.input_path, self.input_format, conn_id=self.storage_conn_id)
-            return list(source.read())
+            loaded = list(source.read())
+            # Checked before anything is sent, as for in-memory records: a bad line found mid-run
+            # would leave earlier batches written, and a retried create would write them again.
+            if not all(isinstance(record, dict) for record in loaded):
+                raise TypeError("input_path must hold one JSON object per record")
+            return loaded
         records = self.records
         if isinstance(records, str):
             # A rendered template is text unless the DAG renders native objects.

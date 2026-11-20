@@ -29,7 +29,9 @@ class RecordFile:
         if file_format not in FILE_FORMATS:
             raise ValueError(f"file_format must be one of {', '.join(FILE_FORMATS)}")
         self.path = ObjectStoragePath(path, conn_id=conn_id) if conn_id else ObjectStoragePath(path)
-        self.local_path = _local_path(path) if conn_id is None else None
+        # A local destination is staged and renamed into place whether or not a storage connection
+        # was given: the connection only matters for object storage.
+        self.local_path = _local_path(path)
         self.file_format = file_format
 
     def write(

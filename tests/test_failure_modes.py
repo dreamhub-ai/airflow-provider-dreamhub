@@ -335,3 +335,39 @@ class TestShapes:
     def test_a_percent_encoded_activity_read_is_refused(self) -> None:
         with pytest.raises(ValueError, match="activities"):
             DreamhubApiOperator(task_id="call", endpoint="companies/c-1/activities/fil%74er", method="post").execute({})
+
+    @respx.mock
+    def test_a_rate_limit_that_outlasts_the_retries_stops_a_delete(self, hook: DreamhubHook) -> None:
+        respx.delete(f"{BASE_URL}/companies/c-1").mock(return_value=httpx.Response(429))
+
+        with pytest.raises(DreamhubBulkError) as raised:
+            hook.bulk("companies", "delete", [{"id": "c-1"}, {"id": "c-2"}])
+
+        assert raised.value.result.failures == [{"key": "c-1", "error": "HTTP 429"}]
+        assert raised.value.not_attempted == [1]
+
+    @respx.mock
+    def test_a_file_with_a_line_that_is_not_an_object_is_refused_before_any_write(self, tmp_path: Path) -> None:
+        source = tmp_path / "in.ndjson"
+        source.write_text('{"name": "Acme", "status": 1}\nnull\n')
+        route = respx.post(f"{BASE_URL}/companies/bulk/create").mock(
+            return_value=httpx.Response(201, json={"successfulIds": ["c-1"], "errors": {}})
+        )
+
+        with pytest.raises(TypeError, match="one JSON object per record"):
+            DreamhubBulkOperator(
+                task_id="load", entity="companies", operation="create", input_path=str(source), batch_size=1
+            ).execute({})
+
+        assert route.call_count == 0
+
+    def test_a_local_file_is_staged_even_with_a_storage_connection(self, tmp_path: Path) -> None:
+        elsewhere = tmp_path / "elsewhere.ndjson"
+        elsewhere.write_text("keep\n")
+        target = tmp_path / "results.ndjson"
+        target.symlink_to(elsewhere)
+
+        RecordFile(str(target), "ndjson", conn_id="any_storage").write([{"id": "c-1"}])
+
+        assert not target.is_symlink()
+        assert elsewhere.read_text() == "keep\n"
