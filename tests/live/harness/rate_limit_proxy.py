@@ -37,12 +37,17 @@ HOP_BY_HOP = frozenset(
     }
 )
 # A request body is forwarded as received, so its encoding header goes with it. A response body
-# arrives already decoded by httpx, so its encoding header no longer applies.
+# arrives already decoded by httpx, so its encoding header no longer applies. The client's own
+# Accept-Encoding is not passed on, so the upstream only uses an encoding httpx can decode.
+REQUEST_ONLY = frozenset({"accept-encoding"})
 RESPONSE_ONLY = frozenset({"content-encoding"})
 
+Headers = list[tuple[str, str]]
 
-def end_to_end(headers: list[tuple[str, str]], also_drop: frozenset[str] = frozenset()) -> dict[str, str]:
-    """The headers to pass on: without the hop-by-hop ones, those named by `Connection`, and ``also_drop``."""
+
+def end_to_end(headers: Headers, also_drop: frozenset[str] = frozenset()) -> Headers:
+    """The headers to pass on, in order and with repeats kept: without the hop-by-hop ones, those
+    named by `Connection`, and ``also_drop``."""
     named = {
         token.strip().lower()
         for name, value in headers
@@ -51,7 +56,7 @@ def end_to_end(headers: list[tuple[str, str]], also_drop: frozenset[str] = froze
         if token.strip()
     }
     dropped = HOP_BY_HOP | also_drop | named
-    return {name: value for name, value in headers if name.lower() not in dropped}
+    return [(name, value) for name, value in headers if name.lower() not in dropped]
 
 
 class RateLimitProxy:
@@ -105,7 +110,7 @@ class RateLimitProxy:
             self.forwarded += 1
             return False
 
-    def forward(self, method: str, path: str, headers: dict[str, str], body: bytes) -> httpx.Response:
+    def forward(self, method: str, path: str, headers: Headers, body: bytes) -> httpx.Response:
         return self._client.request(method, path, headers=headers, content=body)
 
     def record_stats(self) -> None:
@@ -154,27 +159,28 @@ class RateLimitProxy:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b""
                 if not proxy.is_forwardable(self.path):
-                    self._reply(400, {}, b'{"detail":"the proxy forwards only paths on its upstream"}')
+                    self._reply(400, [], b'{"detail":"the proxy forwards only paths on its upstream"}')
                     return
                 if proxy.take_refusal():
                     proxy.record_stats()
-                    self._reply(429, {"Retry-After": str(proxy.retry_after_seconds)}, b'{"detail":"Too Many Requests"}')
+                    retry_after = [("Retry-After", str(proxy.retry_after_seconds))]
+                    self._reply(429, retry_after, b'{"detail":"Too Many Requests"}')
                     return
-                headers = end_to_end(list(self.headers.items()))
+                headers = end_to_end(list(self.headers.items()), REQUEST_ONLY)
                 try:
                     answer = proxy.forward(self.command, self.path, headers, body)
                 except httpx.HTTPError:
                     proxy.record_stats()
-                    self._reply(502, {}, b'{"detail":"proxy could not reach the API"}')
+                    self._reply(502, [], b'{"detail":"proxy could not reach the API"}')
                     return
                 proxy.record_stats()
                 kept = end_to_end(list(answer.headers.multi_items()), RESPONSE_ONLY)
                 self._reply(answer.status_code, kept, answer.content)
 
-            def _reply(self, status: int, headers: dict[str, str], body: bytes) -> None:
+            def _reply(self, status: int, headers: Headers, body: bytes) -> None:
                 self.send_response(status)
                 content_type = "application/json"
-                for name, value in headers.items():
+                for name, value in headers:
                     if name.lower() == "content-type":
                         content_type = value
                     else:

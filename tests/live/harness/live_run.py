@@ -225,7 +225,7 @@ class LiveRun:
                 findings = self.token_findings()
                 if findings:
                     problems.append(f"token found in {len(findings)} log lines")
-        except (AirflowRunError, DockerException, OSError) as error:
+        except Exception as error:  # noqa: BLE001 - any failure here must still leave halt and cleanup to run
             problems.append(f"logs not scanned: {type(error).__name__}")
         try:
             self.airflow.halt()

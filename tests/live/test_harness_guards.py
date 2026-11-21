@@ -16,7 +16,7 @@ import pytest
 from tests.live.harness import config
 from tests.live.harness.config import ApiToken, HarnessConfigError, LiveTarget
 from tests.live.harness.ledger import RecordLedger
-from tests.live.harness.rate_limit_proxy import RESPONSE_ONLY, RateLimitProxy, end_to_end
+from tests.live.harness.rate_limit_proxy import REQUEST_ONLY, RESPONSE_ONLY, RateLimitProxy, end_to_end
 from tests.live.harness.secrets import SecretScanner
 
 # A reserved test domain stands in for the development environment, whose address is not published here.
@@ -179,13 +179,23 @@ class TestEndToEndHeaders:
     def test_drops_hop_by_hop_and_connection_named_headers(self) -> None:
         headers = [("Connection", "keep-alive, X-Hop"), ("X-Hop", "local-only"), ("Host", "h"), ("Accept", "*/*")]
 
-        assert end_to_end(headers) == {"Accept": "*/*"}
+        assert end_to_end(headers) == [("Accept", "*/*")]
 
     def test_keeps_a_request_encoding_and_drops_a_decoded_response_encoding(self) -> None:
         headers = [("Content-Encoding", "gzip"), ("Content-Type", "application/json")]
 
-        assert end_to_end(headers) == {"Content-Encoding": "gzip", "Content-Type": "application/json"}
-        assert end_to_end(headers, RESPONSE_ONLY) == {"Content-Type": "application/json"}
+        assert end_to_end(headers) == headers
+        assert end_to_end(headers, RESPONSE_ONLY) == [("Content-Type", "application/json")]
+
+    def test_keeps_repeated_headers(self) -> None:
+        headers = [("Set-Cookie", "a=1"), ("Set-Cookie", "b=2"), ("Vary", "Accept")]
+
+        assert end_to_end(headers, RESPONSE_ONLY) == headers
+
+    def test_does_not_pass_on_the_client_accept_encoding(self) -> None:
+        headers = [("Accept-Encoding", "br, zstd"), ("Accept", "application/json")]
+
+        assert end_to_end(headers, REQUEST_ONLY) == [("Accept", "application/json")]
 
 
 class TestRateLimitProxy:
