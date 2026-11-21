@@ -28,5 +28,5 @@ def _no_real_sleep(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPat
 
     Live end-to-end tests keep real waits, so a rate limit there is actually waited out.
     """
-    if request.node.get_closest_marker("e2e") is None:
+    if request.node.get_closest_marker("e2e") is None and request.node.get_closest_marker("airflow_live") is None:
         monkeypatch.setattr(dreamhub.time, "sleep", sleeps.append)
