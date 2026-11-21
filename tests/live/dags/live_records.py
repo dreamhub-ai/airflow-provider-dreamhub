@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+# Where the DAGs write their files inside Airflow; the harness reads the results from there.
+OUT_DIR = "/tmp/dreamhub-live"
 # Companies the bulk create writes; the upsert adds one more.
 COMPANY_COUNT = 3
 STATUS_ACTIVE = 1

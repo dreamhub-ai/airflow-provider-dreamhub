@@ -104,7 +104,10 @@ class RateLimitProxy:
 
     @staticmethod
     def is_forwardable(path: str) -> bool:
-        """Only a path on the upstream: an absolute URL (`http://other/x`) or `//other/x` would reach another host."""
+        """Only a path on the upstream: an absolute URL (`http://other/x`) would send the token to another host.
+
+        A leading `//` is refused too, in case the server in use does not fold it into one `/` first.
+        """
         return path.startswith("/") and not path.startswith("//")
 
     def _handler_class(self) -> type[http.server.BaseHTTPRequestHandler]:

@@ -82,10 +82,17 @@ class AirflowContainer:
         self._redact = redact
         self._container: Container | None = None
         self._dag_ids: list[str] = []
+        self._ready = False
 
     @property
     def started(self) -> bool:
+        """A container was created for this run (it may have failed to start or been halted since)."""
         return self._container is not None
+
+    @property
+    def ready(self) -> bool:
+        """Airflow came up and parsed every DAG: the only state worth restarting for its UI."""
+        return self._ready
 
     @property
     def name(self) -> str:
@@ -121,6 +128,7 @@ class AirflowContainer:
             docker.copy(str(path), (self.container, f"{HARNESS_DIR}/{path.name}"))
         docker.container.start(self.container)
         self._wait_for_dags(timeout)
+        self._ready = True
 
     def halt(self) -> None:
         """Stop Airflow, so no DAG run still in flight can write after the run is cleaned up."""
@@ -132,7 +140,7 @@ class AirflowContainer:
         docker.container.start(self.container)
         self._wait_for_dags(timeout)
 
-    def stop(self) -> None:
+    def remove(self) -> None:
         """Remove the container, unless it is kept so its UI can be opened."""
         if self._container is not None and not self.keep:
             docker.container.remove(self._container, force=True)

@@ -46,14 +46,14 @@ these DAGs through the Airflow scheduler:
 - **Failures**: an invalid record and a refused token. Both tasks must fail with a reason, and no
   record may be written to Dreamhub.
 
-Every record a run writes carries the run's marker. When the run ends, Airflow is stopped first, so
-nothing still running can write afterwards. Then every record the tasks reported as written, or that
-still reads back by the run's websites, is deleted and counted, and leftover records fail the run.
-No task log or container output may contain the token.
+Every record a run writes carries the run's marker. When the run ends, the harness reads the ids the
+tasks reported as written, then stops Airflow so nothing still running can write afterwards. Every
+record those reports name, or that still reads back by the run's websites, is deleted and counted,
+and leftover records fail the run. No task log or container output may contain the token.
 
-If a run is killed before it can clean up, its records stay. Each record's website starts with
-`https://airflow-live-<id>-`, where `<id>` is the run marker printed in the summary, and its name
-starts with the marker. Find those companies in the development environment and delete them.
+If a run is killed before it can clean up, its records stay. The summary prints each run's marker
+(it starts with `airflow-live-`). The run's companies have websites starting with `https://<marker>-`
+and names starting with the marker: find them in the development environment and delete them.
 
 The live harness uses its own `DREAMHUB_LIVE_*` settings rather than the `DREAMHUB_E2E_*` ones of the
 read-only `e2e` tests, because it writes and refuses every environment but the development one.
@@ -77,12 +77,13 @@ read-only `e2e` tests, because it writes and refuses every environment but the d
    ```bash
    .venv/bin/pytest -m airflow_live -v
    ```
-   `DREAMHUB_LIVE_AIRFLOW=3` (or `2`) runs one Airflow version only. `DREAMHUB_LIVE_LABELS=key=value,...`
-   adds labels to the containers. The summary at the end lists each run's marker and cleanup
+   `DREAMHUB_LIVE_AIRFLOW=3` (or `2`) runs one Airflow version only.
+   `DREAMHUB_LIVE_LABELS=key=value,...` adds labels to the containers. The summary at the end lists each run's marker and cleanup
    counts.
 
 **See the runs in the Airflow UI.** Run with `DREAMHUB_LIVE_KEEP=1` and the containers stay up
-after the test (Airflow is stopped for the cleanup, then started again). The UI is published on `127.0.0.1` only (port 8082 for Airflow 2, 8083 for
+after the test (Airflow is stopped for the cleanup, then started again; an Airflow that never came up
+is not restarted). The UI is published on `127.0.0.1` only (port 8082 for Airflow 2, 8083 for
 Airflow 3). The summary prints each UI's address, the command that shows its generated login, and
 the command that removes the container. The Dreamhub connections are environment variables, so the
 UI's Connections page does not show them; remove the container when you are done, and revoke the

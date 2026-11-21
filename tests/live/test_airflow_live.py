@@ -19,11 +19,11 @@ import pytest
 pytest.importorskip("python_on_whales", reason="the live harness needs the 'live' extra")
 
 from tests.live.conftest import SUMMARY_KEY  # noqa: E402
-from tests.live.dags.live_records import CLEARED_FIELD  # noqa: E402
-from tests.live.harness.airflow_container import IMAGES, AirflowImage  # noqa: E402
+from tests.live.dags.live_records import CLEARED_FIELD, OUT_DIR  # noqa: E402
+from tests.live.harness.airflow_container import IMAGES, AirflowImage, AirflowRunError  # noqa: E402
 from tests.live.harness.config import ApiToken, HarnessConfigError, LiveTarget  # noqa: E402
 from tests.live.harness.live_api import LiveApi  # noqa: E402
-from tests.live.harness.live_run import OUT_DIR, PROXY_REFUSALS, PROXY_RETRY_AFTER_SECONDS, LiveRun  # noqa: E402
+from tests.live.harness.live_run import PROXY_REFUSALS, PROXY_RETRY_AFTER_SECONDS, LiveRun  # noqa: E402
 
 pytestmark = pytest.mark.airflow_live
 
@@ -48,8 +48,12 @@ def provider_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """The provider as it would be published, built from this checkout."""
     out = tmp_path_factory.mktemp("wheel")
     command = [sys.executable, "-m", "pip", "wheel", "--quiet", "--no-deps", "-w", str(out), str(ROOT)]
-    # The build needs no Airflow connection, so it does not inherit any (they can hold the token).
-    env = {name: value for name, value in os.environ.items() if not name.startswith("AIRFLOW_CONN_")}
+    # The build needs no Dreamhub setting, so it inherits none of those that can hold the token.
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("AIRFLOW_CONN_", "DREAMHUB_LIVE_", "DREAMHUB_E2E_"))
+    }
     subprocess.run(command, check=True, env=env)
     return next(out.glob("airflow_provider_dreamhub-*.whl"))
 
@@ -93,13 +97,16 @@ def live_run(
         yield run
     finally:
         try:
-            # Stop Airflow first: a run still in flight (a timeout, an interrupt) must not write after cleanup.
-            run.halt()
-            report = run.clean_up()
+            # Reads what the tasks reported, stops Airflow so nothing in flight writes, then cleans up.
+            report = run.tear_down()
             summary.append(f"{image.label}: cleanup {json.dumps(report)}")
-            if keep and run.airflow.started:
-                run.airflow.resume()
-                summary.append(run.airflow.ui_instructions())
+            # Only an Airflow that came up is worth restarting; after a failed start the error above stands.
+            if keep and run.airflow.ready:
+                try:
+                    run.airflow.resume()
+                    summary.append(run.airflow.ui_instructions())
+                except AirflowRunError as error:
+                    summary.append(f"{image.label}: the UI could not be restarted: {error}")
         finally:
             run.close()
     if report.get("leftovers") or report.get("still_readable"):
@@ -132,6 +139,7 @@ def test_rate_limit_is_waited_out(live_run: LiveRun) -> None:
     assert stats["forwarded"] >= 1
     lines = live_run.airflow.count_lines(f"{OUT_DIR}/rate_limited_revenue_items.ndjson")
     assert lines == live_run.api.total("revenue_items")
+    assert lines > 0, "an empty extract proves nothing; run against an account with revenue items"
     logs = live_run.collect_logs()
     task_log = live_run.airflow.task_log(logs, "dreamhub_live_rate_limit", "extract_through_rate_limit")
     assert task_log.count(f"rate limited; retrying in {PROXY_RETRY_AFTER_SECONDS:.1f}s") == PROXY_REFUSALS
@@ -168,6 +176,8 @@ def test_bulk_create_update_upsert_and_overwrite(live_run: LiveRun) -> None:
     assert {website: len(rows) for website, rows in found.items()} == dict.fromkeys(expected, 1)
     # What the operators reported writing is exactly what reads back: no write went unseen.
     assert written == {str(rows[0]["id"]) for rows in found.values()}
+    # The read by id that cleanup and the delete test rely on finds live records.
+    assert set(live_run.api.existing_ids("companies", sorted(written))) == written
     actual = {website: (rows[0]["name"], rows[0].get(CLEARED_FIELD)) for website, rows in found.items()}
     assert actual == expected
 

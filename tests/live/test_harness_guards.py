@@ -219,12 +219,13 @@ class TestRateLimitProxy:
         assert _Upstream.received == []
 
     def test_a_double_slash_path_stays_on_the_upstream(self, upstream: str) -> None:
-        # http.server folds a leading `//` into one `/`, so this is a path on the upstream, not a host.
+        # Recent Python releases fold a leading `//` into one `/` before the proxy sees it (a path on the
+        # upstream); without that, the proxy refuses it. Either way nothing goes to another host.
         with RateLimitProxy(upstream=upstream, refusals=0, retry_after_seconds=1) as proxy:
             status = self._raw_get(proxy, "//elsewhere.example/steal")
 
-        assert status == 200
-        assert [path for _, path, _, _ in _Upstream.received] == ["/elsewhere.example/steal"]
+        received = [path for _, path, _, _ in _Upstream.received]
+        assert (status, received) in [(200, ["/elsewhere.example/steal"]), (400, [])]
 
     def test_writes_its_counts_for_the_harness(self, upstream: str, tmp_path: Path) -> None:
         stats = tmp_path / "stats.json"

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from airflow import DAG
-from live_records import CompanyFixture, Records
+from live_records import OUT_DIR, CompanyFixture, Records
 
 from dreamhub_airflow.operators.bulk import DreamhubBulkOperator
 from dreamhub_airflow.operators.extract import DreamhubExtractOperator
@@ -26,7 +26,7 @@ with DAG(
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
-    params={"run_marker": "", "out_dir": "/tmp/dreamhub-live"},
+    params={"run_marker": "", "out_dir": OUT_DIR},
     default_args={"retries": 0},
     tags=["dreamhub", "live-test"],
 ) as dag:

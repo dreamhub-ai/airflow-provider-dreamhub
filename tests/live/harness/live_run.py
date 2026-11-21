@@ -7,8 +7,10 @@ import os
 import tempfile
 from pathlib import Path
 
-from tests.live.dags.live_records import CompanyFixture
-from tests.live.harness.airflow_container import HARNESS_DIR, AirflowContainer, AirflowImage
+from python_on_whales.exceptions import DockerException
+
+from tests.live.dags.live_records import OUT_DIR, CompanyFixture
+from tests.live.harness.airflow_container import HARNESS_DIR, AirflowContainer, AirflowImage, AirflowRunError
 from tests.live.harness.config import ApiToken, LiveTarget
 from tests.live.harness.ledger import RecordLedger
 from tests.live.harness.live_api import LiveApi
@@ -17,8 +19,6 @@ from tests.live.harness.secrets import SecretScanner
 LIVE_DIR = Path(__file__).resolve().parent.parent
 DAGS_DIR = LIVE_DIR / "dags"
 PROXY_SCRIPT = Path(__file__).resolve().parent / "rate_limit_proxy.py"
-# Must match the DAGs' default `out_dir` param; the harness also passes it in every run's conf.
-OUT_DIR = "/tmp/dreamhub-live"
 PROXY_PORT = 8765
 PROXY_REFUSALS = 2
 PROXY_RETRY_AFTER_SECONDS = 2
@@ -34,6 +34,14 @@ DAG_IDS = [
 ]
 # A token the API refuses: same shape as a real one, so the refusal is the API's, not a format check.
 REFUSED_TOKEN = "pat_" + "0" * 40
+# Every results file a write task may leave in OUT_DIR, read before Airflow stops.
+WRITE_RESULTS = [
+    "bulk_create.ndjson",
+    "bulk_update.ndjson",
+    "bulk_upsert.ndjson",
+    "bulk_overwrite.ndjson",
+    "invalid_results.ndjson",
+]
 
 
 class ConnectionEnvFile:
@@ -135,11 +143,15 @@ class LiveRun:
         return json.loads(self.airflow.read_text(PROXY_STATS))
 
     def results(self, name: str) -> dict[str, object] | None:
-        """The summary a bulk task wrote to ``{OUT_DIR}/{name}``, or None when the task never wrote one."""
+        """The summary a bulk task wrote to ``{OUT_DIR}/{name}``, or None when the task wrote none.
+
+        The operator writes one summary line. Its text is redacted before use, since assertions quote it.
+        """
         path = f"{OUT_DIR}/{name}"
         if not self.airflow.file_exists(path):
             return None
-        return json.loads(self.airflow.read_text(path).splitlines()[0])
+        lines = self._scanner.redact(self.airflow.read_text(path)).splitlines()
+        return json.loads(lines[0]) if lines else None
 
     def succeeded_ids(self, name: str) -> set[str]:
         """The ids the bulk task that wrote ``{OUT_DIR}/{name}`` reports as succeeded (none if it wrote no file)."""
@@ -173,9 +185,27 @@ class LiveRun:
     def token_findings(self) -> list[str]:
         return self._scanner.scan_tree(self.artifacts)
 
-    def halt(self) -> None:
-        """Stop every writer before cleanup, so nothing in flight writes after it."""
-        self.airflow.halt()
+    def tear_down(self) -> dict[str, object]:
+        """End the run: count what the tasks reported, stop Airflow, then clean up whatever happened before.
+
+        Results are read while Airflow still runs (a stopped container cannot be read), so even a run
+        that timed out has its written ids counted. Airflow is stopped next, so nothing in flight writes
+        after the cleanup. Cleanup itself always runs: it needs only the API, not the container.
+        """
+        problems: list[str] = []
+        try:
+            if self.airflow.started:
+                self.record_written(WRITE_RESULTS)
+        except (AirflowRunError, DockerException, ValueError) as error:
+            problems.append(f"results not read: {type(error).__name__}")
+        try:
+            self.airflow.halt()
+        except DockerException as error:
+            problems.append(f"Airflow not stopped, a run may still write: {type(error).__name__}")
+        report = self.clean_up()
+        if problems:
+            report["problems"] = problems
+        return report
 
     def clean_up(self) -> dict[str, object]:
         """Soft-delete every record of this run still readable, then report the counts and any leftovers.
@@ -199,6 +229,6 @@ class LiveRun:
 
     def close(self) -> None:
         try:
-            self.airflow.stop()
+            self.airflow.remove()
         finally:
             self._env.remove()
