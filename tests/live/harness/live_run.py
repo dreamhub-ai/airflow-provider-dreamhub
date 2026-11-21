@@ -207,8 +207,11 @@ class LiveRun:
         that timed out has its written ids counted. Airflow is stopped next, so nothing in flight writes
         after the cleanup. Cleanup itself always runs: it needs only the API, not the container.
 
-        ``problems`` lists what could not be confirmed (ids not read, Airflow not stopped). Either one
-        means a record could exist that cleanup did not see, so the caller fails the run on it.
+        The final logs are also scanned for the token here, so the check runs even when a failed or
+        filtered test run (``-x``, ``-k``) never reaches the dedicated test.
+
+        ``problems`` lists what failed or could not be confirmed (ids not read, the token found or the
+        logs not scanned, Airflow not stopped); the caller fails the run on any of them.
         """
         problems: list[str] = []
         try:
@@ -216,6 +219,14 @@ class LiveRun:
                 self.record_written(WRITE_RESULTS)
         except (AirflowRunError, DockerException, ValueError) as error:
             problems.append(f"results not read: {type(error).__name__}")
+        try:
+            if self.airflow.started:
+                self.collect_logs()
+                findings = self.token_findings()
+                if findings:
+                    problems.append(f"token found in {len(findings)} log lines")
+        except (AirflowRunError, DockerException, OSError) as error:
+            problems.append(f"logs not scanned: {type(error).__name__}")
         try:
             self.airflow.halt()
         except DockerException as error:

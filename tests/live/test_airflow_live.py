@@ -35,7 +35,11 @@ from tests.live.harness.live_run import (  # noqa: E402
 pytestmark = pytest.mark.airflow_live
 
 ROOT = Path(__file__).resolve().parents[2]
-WANTED_MAJORS = {part.strip() for part in os.environ.get("DREAMHUB_LIVE_AIRFLOW", "2,3").split(",")}
+WANTED_MAJORS = {part.strip() for part in os.environ.get("DREAMHUB_LIVE_AIRFLOW", "2,3").split(",") if part.strip()}
+KNOWN_MAJORS = {str(image.major) for image in IMAGES}
+if not WANTED_MAJORS or not WANTED_MAJORS <= KNOWN_MAJORS:
+    # An empty selection would skip every live test and still report success.
+    raise pytest.UsageError(f"DREAMHUB_LIVE_AIRFLOW must name Airflow majors among {sorted(KNOWN_MAJORS)}")
 SELECTED_IMAGES = [image for image in IMAGES if str(image.major) in WANTED_MAJORS]
 
 
@@ -96,7 +100,12 @@ def live_run(
         artifacts=tmp_path_factory.mktemp(f"live-{image.label}"),
     )
     summary = request.config.stash[SUMMARY_KEY]
-    summary.append(f"{image.label}: run marker {run.ledger.run_marker}; logs under {run.artifacts}")
+    started = f"{image.label}: run marker {run.ledger.run_marker}; logs under {run.artifacts}"
+    summary.append(started)
+    # Shown now, before any record is written, so a run killed before the summary can still be found.
+    reporter = request.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(f"Dreamhub live run started: {started}")
     report: dict[str, object] = {}
     try:
         run.start()

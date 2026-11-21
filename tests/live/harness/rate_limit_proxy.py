@@ -20,7 +20,8 @@ from types import TracebackType
 
 import httpx
 
-# Headers that describe one hop, not the message: never forwarded in either direction.
+# Headers that describe one hop, not the message: never forwarded in either direction. Any header a
+# message names in its own `Connection` header is hop-by-hop too (RFC 9110, 7.6.1).
 HOP_BY_HOP = frozenset(
     {
         "connection",
@@ -33,9 +34,24 @@ HOP_BY_HOP = frozenset(
         "upgrade",
         "host",
         "content-length",
-        "content-encoding",
     }
 )
+# A request body is forwarded as received, so its encoding header goes with it. A response body
+# arrives already decoded by httpx, so its encoding header no longer applies.
+RESPONSE_ONLY = frozenset({"content-encoding"})
+
+
+def end_to_end(headers: list[tuple[str, str]], also_drop: frozenset[str] = frozenset()) -> dict[str, str]:
+    """The headers to pass on: without the hop-by-hop ones, those named by `Connection`, and ``also_drop``."""
+    named = {
+        token.strip().lower()
+        for name, value in headers
+        if name.lower() == "connection"
+        for token in value.split(",")
+        if token.strip()
+    }
+    dropped = HOP_BY_HOP | also_drop | named
+    return {name: value for name, value in headers if name.lower() not in dropped}
 
 
 class RateLimitProxy:
@@ -144,7 +160,7 @@ class RateLimitProxy:
                     proxy.record_stats()
                     self._reply(429, {"Retry-After": str(proxy.retry_after_seconds)}, b'{"detail":"Too Many Requests"}')
                     return
-                headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
+                headers = end_to_end(list(self.headers.items()))
                 try:
                     answer = proxy.forward(self.command, self.path, headers, body)
                 except httpx.HTTPError:
@@ -152,7 +168,7 @@ class RateLimitProxy:
                     self._reply(502, {}, b'{"detail":"proxy could not reach the API"}')
                     return
                 proxy.record_stats()
-                kept = {k: v for k, v in answer.headers.items() if k.lower() not in HOP_BY_HOP}
+                kept = end_to_end(list(answer.headers.multi_items()), RESPONSE_ONLY)
                 self._reply(answer.status_code, kept, answer.content)
 
             def _reply(self, status: int, headers: dict[str, str], body: bytes) -> None:

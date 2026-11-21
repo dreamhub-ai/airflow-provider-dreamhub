@@ -16,7 +16,7 @@ import pytest
 from tests.live.harness import config
 from tests.live.harness.config import ApiToken, HarnessConfigError, LiveTarget
 from tests.live.harness.ledger import RecordLedger
-from tests.live.harness.rate_limit_proxy import RateLimitProxy
+from tests.live.harness.rate_limit_proxy import RESPONSE_ONLY, RateLimitProxy, end_to_end
 from tests.live.harness.secrets import SecretScanner
 
 # A reserved test domain stands in for the development environment, whose address is not published here.
@@ -173,6 +173,19 @@ def upstream() -> Iterator[str]:
     thread.start()
     yield f"http://127.0.0.1:{server.server_address[1]}"
     server.shutdown()
+
+
+class TestEndToEndHeaders:
+    def test_drops_hop_by_hop_and_connection_named_headers(self) -> None:
+        headers = [("Connection", "keep-alive, X-Hop"), ("X-Hop", "local-only"), ("Host", "h"), ("Accept", "*/*")]
+
+        assert end_to_end(headers) == {"Accept": "*/*"}
+
+    def test_keeps_a_request_encoding_and_drops_a_decoded_response_encoding(self) -> None:
+        headers = [("Content-Encoding", "gzip"), ("Content-Type", "application/json")]
+
+        assert end_to_end(headers) == {"Content-Encoding": "gzip", "Content-Type": "application/json"}
+        assert end_to_end(headers, RESPONSE_ONLY) == {"Content-Type": "application/json"}
 
 
 class TestRateLimitProxy:

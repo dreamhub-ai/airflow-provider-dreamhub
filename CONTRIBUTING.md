@@ -53,8 +53,8 @@ Leftover records fail the run, and so does a cleanup the harness could not confi
 could not be read, or Airflow could not be stopped). No task log or container output may contain the
 token.
 
-If a run is killed before it can clean up, its records stay. The summary prints each run's marker
-(it starts with `airflow-live-`). The run's companies have websites starting with `https://<marker>-`
+If a run is killed before it can clean up, its records stay. Each run's marker (it starts with
+`airflow-live-`) is printed when the run starts, before anything is written, and again in the summary. The run's companies have websites starting with `https://<marker>-`
 and names starting with the marker: find them in the development environment and delete them.
 
 The live harness uses its own `DREAMHUB_LIVE_*` settings rather than the `DREAMHUB_E2E_*` ones of the
