@@ -19,7 +19,7 @@ import pytest
 pytest.importorskip("python_on_whales", reason="the live harness needs the 'live' extra")
 
 from tests.live.conftest import SUMMARY_KEY  # noqa: E402
-from tests.live.dags.live_records import CLEARED_FIELD, PHONE  # noqa: E402
+from tests.live.dags.live_records import CLEARED_FIELD  # noqa: E402
 from tests.live.harness.airflow_container import IMAGES, AirflowImage  # noqa: E402
 from tests.live.harness.config import ApiToken, HarnessConfigError, LiveTarget  # noqa: E402
 from tests.live.harness.live_api import LiveApi  # noqa: E402
@@ -30,14 +30,17 @@ pytestmark = pytest.mark.airflow_live
 ROOT = Path(__file__).resolve().parents[2]
 WANTED_MAJORS = {part.strip() for part in os.environ.get("DREAMHUB_LIVE_AIRFLOW", "2,3").split(",")}
 SELECTED_IMAGES = [image for image in IMAGES if str(image.major) in WANTED_MAJORS]
+BULK_RESULTS = ["bulk_create.ndjson", "bulk_update.ndjson", "bulk_upsert.ndjson", "bulk_overwrite.ndjson"]
 
 
 @pytest.fixture(scope="session")
 def live_config() -> tuple[LiveTarget, ApiToken]:
+    # These tests run only when selected with `-m airflow_live`; a missing setting then is an error,
+    # not a skip that would read as a pass.
     try:
         return LiveTarget.from_environment(), ApiToken.from_environment()
     except HarnessConfigError as error:
-        pytest.skip(f"live harness not configured: {error}")
+        pytest.fail(f"live harness not configured: {error}")
 
 
 @pytest.fixture(scope="session")
@@ -45,7 +48,9 @@ def provider_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """The provider as it would be published, built from this checkout."""
     out = tmp_path_factory.mktemp("wheel")
     command = [sys.executable, "-m", "pip", "wheel", "--quiet", "--no-deps", "-w", str(out), str(ROOT)]
-    subprocess.run(command, check=True)
+    # The build needs no Airflow connection, so it does not inherit any (they can hold the token).
+    env = {name: value for name, value in os.environ.items() if not name.startswith("AIRFLOW_CONN_")}
+    subprocess.run(command, check=True, env=env)
     return next(out.glob("airflow_provider_dreamhub-*.whl"))
 
 
@@ -88,9 +93,12 @@ def live_run(
         yield run
     finally:
         try:
+            # Stop Airflow first: a run still in flight (a timeout, an interrupt) must not write after cleanup.
+            run.halt()
             report = run.clean_up()
             summary.append(f"{image.label}: cleanup {json.dumps(report)}")
-            if keep:
+            if keep and run.airflow.started:
+                run.airflow.resume()
                 summary.append(run.airflow.ui_instructions())
         finally:
             run.close()
@@ -110,6 +118,7 @@ def test_extract_writes_every_record(live_run: LiveRun) -> None:
         lines = live_run.airflow.count_lines(f"{OUT_DIR}/{entity}.ndjson")
         # Read right after the extract; the extract itself fails if the total moved while it read.
         assert lines == live_run.api.total(entity), entity
+        assert lines > 0, f"{entity}: an empty extract proves nothing; run against an account with data"
 
 
 def test_rate_limit_is_waited_out(live_run: LiveRun) -> None:
@@ -128,17 +137,19 @@ def test_rate_limit_is_waited_out(live_run: LiveRun) -> None:
     assert task_log.count(f"rate limited; retrying in {PROXY_RETRY_AFTER_SECONDS:.1f}s") == PROXY_REFUSALS
 
 
-def test_failures_are_reported_and_nothing_is_written(live_run: LiveRun) -> None:
+def test_failures_are_reported_and_no_record_is_written(live_run: LiveRun) -> None:
     run_id, state = live_run.run_dag("dreamhub_live_failure")
 
     assert state == "failed"
     states = live_run.airflow.task_states("dreamhub_live_failure", run_id)
     assert states["create_invalid_record"] == "failed"
     assert states["extract_with_refused_token"] == "failed"
-    results = json.loads(live_run.airflow.read_text(f"{OUT_DIR}/invalid_results.ndjson").splitlines()[0])
-    assert results["succeeded"] == 0
+    results = live_run.results("invalid_results.ndjson")
+    assert results is not None
+    assert live_run.record_written(["invalid_results.ndjson"]) == set()
     assert results["failed"] == 1
-    assert "status" in results["failures"][0]["error"]
+    failures = results["failures"]
+    assert isinstance(failures, list) and "status" in failures[0]["error"]
     assert live_run.api.ids_by_website([live_run.companies.invalid_website()]) == []
     assert not live_run.airflow.file_exists(f"{OUT_DIR}/never_written.ndjson")
     logs = live_run.collect_logs()
@@ -149,26 +160,29 @@ def test_failures_are_reported_and_nothing_is_written(live_run: LiveRun) -> None
 def test_bulk_create_update_upsert_and_overwrite(live_run: LiveRun) -> None:
     run_id, state = live_run.run_dag("dreamhub_live_bulk")
 
-    found = live_run.record_created_companies()
+    # Count what the tasks report as written before anything can fail, so cleanup finds it all.
+    written = live_run.record_written(BULK_RESULTS)
+    found = live_run.read_back_companies()
     assert state == "success", live_run.airflow.task_states("dreamhub_live_bulk", run_id)
-    expected = live_run.companies.expected_names()
+    expected = live_run.companies.expected()
     assert {website: len(rows) for website, rows in found.items()} == dict.fromkeys(expected, 1)
-    assert {website: rows[0]["name"] for website, rows in found.items()} == expected
-    phones = {website: rows[0].get(CLEARED_FIELD) for website, rows in found.items()}
-    overwritten = live_run.companies.website(2)
-    assert phones.pop(overwritten) is None
-    assert set(phones.values()) == {PHONE}
+    # What the operators reported writing is exactly what reads back: no write went unseen.
+    assert written == {str(rows[0]["id"]) for rows in found.values()}
+    actual = {website: (rows[0]["name"], rows[0].get(CLEARED_FIELD)) for website, rows in found.items()}
+    assert actual == expected
 
 
 def test_delete_by_match_field(live_run: LiveRun) -> None:
-    created = live_run.api.ids_by_website(live_run.companies.all_websites())
+    created = set(live_run.api.ids_by_website(live_run.companies.all_websites()))
     assert created, "the bulk test must run first and leave the run's companies to delete"
 
     run_id, state = live_run.run_dag("dreamhub_live_delete")
 
+    deleted = live_run.record_deleted("delete.ndjson")
     assert state == "success", live_run.airflow.task_states("dreamhub_live_delete", run_id)
+    assert deleted == created
     assert live_run.api.ids_by_website(live_run.companies.all_websites()) == []
-    live_run.ledger.deleted("companies", created)
+    assert live_run.api.existing_ids("companies", sorted(created)) == []
 
 
 def test_no_token_in_any_log(live_run: LiveRun) -> None:

@@ -10,9 +10,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 # The only Dreamhub API the harness writes to: Dreamhub's development environment, matched as an
-# exact origin (scheme and host). Kept as a SHA-256 so this public repository does not publish
-# the environment's address; maintainers get the URL from the team. The same gateway serves other
-# names too, so nothing looser than the whole origin is safe.
+# exact origin (scheme and host); the exact match is what keeps every other environment out.
+# Stored as a SHA-256 only so the address is not written out in this public repository: that is
+# not a secret, since a guessed host can be checked against it. Maintainers get the URL from the
+# team. Nothing looser than the whole origin is safe, because other names share the same domain.
 ALLOWED_ORIGIN_SHA256 = frozenset({"820eb7fa5601286c8a55e7b770e8c259b5cbcb35aa104e0774fe2c896ac96fa3"})
 API_PATH = "/api/v1"
 

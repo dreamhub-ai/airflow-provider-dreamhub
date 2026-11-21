@@ -24,6 +24,9 @@ class RecordLedger:
     def deleted(self, entity: str, ids: list[str]) -> None:
         self._deleted[entity].update(ids)
 
+    def created_ids(self, entity: str) -> list[str]:
+        return sorted(self._created[entity])
+
     def leftovers(self) -> dict[str, list[str]]:
         """Records created but not deleted, by entity."""
         left = {entity: sorted(ids - self._deleted[entity]) for entity, ids in self._created.items()}

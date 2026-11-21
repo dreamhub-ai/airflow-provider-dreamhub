@@ -37,17 +37,26 @@ these DAGs through the Airflow scheduler:
 
 - **Extract**: companies and revenue items to NDJSON files. The line counts must equal the API's
   totals.
-- **Bulk**: create test companies, then update and upsert them by a match field, and clear a
-  field with `override=True`.
+- **Bulk**: create test companies, then update and upsert them by a match field (a null under the
+  default `override=False` keeps the stored value), and clear a field with `override=True`. The ids
+  the tasks report as written must be exactly the companies that read back.
 - **Delete**: delete the test companies by the match field.
 - **Rate limit**: an extract through a local proxy that answers `429` with `Retry-After` first.
   The task must wait and finish.
-- **Failures**: an invalid record and a refused token. Both tasks must fail with a reason, and
-  nothing may be written.
+- **Failures**: an invalid record and a refused token. Both tasks must fail with a reason, and no
+  record may be written to Dreamhub.
 
-Every record a run writes carries the run's marker. When the run ends, anything still there is
-deleted and counted; leftover records fail the run. No task log or container output may contain
-the token.
+Every record a run writes carries the run's marker. When the run ends, Airflow is stopped first, so
+nothing still running can write afterwards. Then every record the tasks reported as written, or that
+still reads back by the run's websites, is deleted and counted, and leftover records fail the run.
+No task log or container output may contain the token.
+
+If a run is killed before it can clean up, its records stay. Each record's website starts with
+`https://airflow-live-<id>-`, where `<id>` is the run marker printed in the summary, and its name
+starts with the marker. Find those companies in the development environment and delete them.
+
+The live harness uses its own `DREAMHUB_LIVE_*` settings rather than the `DREAMHUB_E2E_*` ones of the
+read-only `e2e` tests, because it writes and refuses every environment but the development one.
 
 1. Install the extra tools and start Docker:
    ```bash
@@ -61,7 +70,9 @@ the token.
    export DREAMHUB_LIVE_URL=<development API URL ending in /api/v1>
    ```
    `DREAMHUB_LIVE_TOKEN` works too. The token reaches Airflow through an owner-only env file,
-   never through a command line.
+   never through a command line. It is then part of the container's environment, visible to
+   `docker inspect`, until the container is removed, so use a dedicated key you can revoke.
+   Without these settings, `pytest -m airflow_live` fails rather than skipping.
 3. Run it:
    ```bash
    .venv/bin/pytest -m airflow_live -v
@@ -71,7 +82,7 @@ the token.
    counts.
 
 **See the runs in the Airflow UI.** Run with `DREAMHUB_LIVE_KEEP=1` and the containers stay up
-after the test. The UI is published on `127.0.0.1` only (port 8082 for Airflow 2, 8083 for
+after the test (Airflow is stopped for the cleanup, then started again). The UI is published on `127.0.0.1` only (port 8082 for Airflow 2, 8083 for
 Airflow 3). The summary prints each UI's address, the command that shows its generated login, and
 the command that removes the container. The Dreamhub connections are environment variables, so the
 UI's Connections page does not show them; remove the container when you are done, and revoke the

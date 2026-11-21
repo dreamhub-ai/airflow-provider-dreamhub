@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from airflow import DAG
-from live_records import CompanyFixture
+from live_records import CompanyFixture, Records
 
 from dreamhub_airflow.operators.bulk import DreamhubBulkOperator
 from dreamhub_airflow.operators.extract import DreamhubExtractOperator
@@ -17,8 +17,8 @@ except ImportError:  # Airflow 2
 
 
 @task
-def invalid_records(params: dict | None = None) -> list[dict[str, object]]:
-    return CompanyFixture((params or {}).get("run_marker", "")).invalid()
+def invalid_records(params: dict[str, object] | None = None) -> Records:
+    return CompanyFixture(str((params or {}).get("run_marker", ""))).invalid()
 
 
 with DAG(

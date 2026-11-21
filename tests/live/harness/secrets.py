@@ -20,6 +20,12 @@ class SecretScanner:
     def findings(self, text: str, source: str = "text") -> list[str]:
         return [f"{source}: line {number}" for number, line in enumerate(text.splitlines(), 1) if self._hit(line)]
 
+    def redact(self, text: str) -> str:
+        """``text`` with the token, and its prefix, replaced by ``***``."""
+        for needle in sorted(self._needles, key=len, reverse=True):
+            text = text.replace(needle, "***")
+        return text
+
     def scan_tree(self, root: Path) -> list[str]:
         """Findings in every file under ``root``."""
         found: list[str] = []

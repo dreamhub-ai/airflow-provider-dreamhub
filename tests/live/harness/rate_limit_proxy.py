@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import http.server
 import json
+import os
 import threading
 from pathlib import Path
 from types import TracebackType
@@ -96,7 +97,15 @@ class RateLimitProxy:
         if self.stats_path is not None:
             with self._lock:
                 stats = {"refused": self.refused, "forwarded": self.forwarded}
-            self.stats_path.write_text(json.dumps(stats))
+                # Write then rename, so a reader never sees a half-written file.
+                partial = self.stats_path.with_name(self.stats_path.name + ".partial")
+                partial.write_text(json.dumps(stats))
+                os.replace(partial, self.stats_path)
+
+    @staticmethod
+    def is_forwardable(path: str) -> bool:
+        """Only a path on the upstream: an absolute URL (`http://other/x`) or `//other/x` would reach another host."""
+        return path.startswith("/") and not path.startswith("//")
 
     def _handler_class(self) -> type[http.server.BaseHTTPRequestHandler]:
         proxy = self
@@ -125,6 +134,9 @@ class RateLimitProxy:
             def _handle(self) -> None:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b""
+                if not proxy.is_forwardable(self.path):
+                    self._reply(400, {}, b'{"detail":"the proxy forwards only paths on its upstream"}')
+                    return
                 if proxy.take_refusal():
                     proxy.record_stats()
                     self._reply(429, {"Retry-After": str(proxy.retry_after_seconds)}, b'{"detail":"Too Many Requests"}')
@@ -142,9 +154,13 @@ class RateLimitProxy:
 
             def _reply(self, status: int, headers: dict[str, str], body: bytes) -> None:
                 self.send_response(status)
+                content_type = "application/json"
                 for name, value in headers.items():
-                    self.send_header(name, value)
-                self.send_header("Content-Type", headers.get("content-type", "application/json"))
+                    if name.lower() == "content-type":
+                        content_type = value
+                    else:
+                        self.send_header(name, value)
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)

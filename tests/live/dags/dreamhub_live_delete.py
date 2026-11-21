@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from airflow import DAG
-from live_records import MATCH_FIELD, CompanyFixture
+from live_records import MATCH_FIELD, CompanyFixture, Records
 
 from dreamhub_airflow.operators.bulk import DreamhubBulkOperator
 
@@ -16,8 +16,8 @@ except ImportError:  # Airflow 2
 
 
 @task
-def to_delete(params: dict | None = None) -> list[dict[str, object]]:
-    return CompanyFixture((params or {}).get("run_marker", "")).to_delete()
+def to_delete(params: dict[str, object] | None = None) -> Records:
+    return CompanyFixture(str((params or {}).get("run_marker", ""))).to_delete()
 
 
 with DAG(
@@ -25,7 +25,7 @@ with DAG(
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
-    params={"run_marker": ""},
+    params={"run_marker": "", "out_dir": "/tmp/dreamhub-live"},
     default_args={"retries": 0},
     tags=["dreamhub", "live-test"],
 ) as dag:
@@ -35,4 +35,5 @@ with DAG(
         operation="delete",
         match_field=MATCH_FIELD,
         records=to_delete(),
+        results_path="{{ params.out_dir }}/delete.ndjson",
     )

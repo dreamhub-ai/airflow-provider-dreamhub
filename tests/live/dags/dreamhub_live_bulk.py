@@ -1,11 +1,15 @@
-"""Live harness: create test companies, then update, upsert and fully overwrite them by a match field."""
+"""Live harness: create test companies, then update, upsert and fully overwrite them by a match field.
+
+Each step writes its full result to ``{out_dir}/bulk_<step>.ndjson``; the harness counts every id
+those files report as written, so cleanup does not depend on reading the records back.
+"""
 
 from __future__ import annotations
 
 from datetime import datetime
 
 from airflow import DAG
-from live_records import MATCH_FIELD, CompanyFixture
+from live_records import MATCH_FIELD, CompanyFixture, Records
 
 from dreamhub_airflow.operators.bulk import DreamhubBulkOperator
 
@@ -16,9 +20,21 @@ except ImportError:  # Airflow 2
 
 
 @task
-def records(step: str, params: dict | None = None) -> list[dict[str, object]]:
-    fixture = CompanyFixture((params or {}).get("run_marker", ""))
-    return getattr(fixture, f"to_{step}")()
+def records(step: str, params: dict[str, object] | None = None) -> Records:
+    fixture = CompanyFixture(str((params or {}).get("run_marker", "")))
+    return fixture.steps()[step]()
+
+
+def bulk_step(step: str, operation: str, *, override: bool = False) -> DreamhubBulkOperator:
+    return DreamhubBulkOperator(
+        task_id=step,
+        entity="companies",
+        operation=operation,
+        match_field=None if operation == "create" else MATCH_FIELD,
+        override=override,
+        records=records.override(task_id=f"to_{step}")(step),
+        results_path="{{ params.out_dir }}/bulk_" + step + ".ndjson",
+    )
 
 
 with DAG(
@@ -26,36 +42,13 @@ with DAG(
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
-    params={"run_marker": ""},
+    params={"run_marker": "", "out_dir": "/tmp/dreamhub-live"},
     default_args={"retries": 0},
     tags=["dreamhub", "live-test"],
 ) as dag:
-    create = DreamhubBulkOperator(
-        task_id="create",
-        entity="companies",
-        operation="create",
-        records=records.override(task_id="to_create")("create"),
+    (
+        bulk_step("create", "create")
+        >> bulk_step("update", "update")
+        >> bulk_step("upsert", "upsert")
+        >> bulk_step("overwrite", "update", override=True)
     )
-    update = DreamhubBulkOperator(
-        task_id="update_by_match_field",
-        entity="companies",
-        operation="update",
-        match_field=MATCH_FIELD,
-        records=records.override(task_id="to_update")("update"),
-    )
-    upsert = DreamhubBulkOperator(
-        task_id="upsert_by_match_field",
-        entity="companies",
-        operation="upsert",
-        match_field=MATCH_FIELD,
-        records=records.override(task_id="to_upsert")("upsert"),
-    )
-    overwrite = DreamhubBulkOperator(
-        task_id="full_overwrite",
-        entity="companies",
-        operation="update",
-        match_field=MATCH_FIELD,
-        override=True,
-        records=records.override(task_id="to_overwrite")("overwrite"),
-    )
-    create >> update >> upsert >> overwrite

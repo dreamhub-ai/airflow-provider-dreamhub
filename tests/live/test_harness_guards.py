@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import http.server
+import json
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -31,6 +33,13 @@ def dev_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
 class TestLiveTarget:
     def test_ships_exactly_one_allowed_origin(self) -> None:
         assert len(config.ALLOWED_ORIGIN_SHA256) == 1
+
+    @pytest.mark.parametrize("origin", ["https://crm.dreamhub.ai", "https://api.dreamhub.ai"])
+    def test_the_shipped_allowlist_refuses_production(self, origin: str) -> None:
+        # Unpatched on purpose: this pins the allowlist that ships, not a test stand-in.
+        assert not LiveTarget.is_allowed_origin(origin)
+        with pytest.raises(HarnessConfigError):
+            LiveTarget.from_url(origin + "/api/v1")
 
     @pytest.mark.usefixtures("dev_allowed")
     def test_accepts_the_allowed_api(self) -> None:
@@ -100,6 +109,14 @@ class TestSecretScanner:
 
         assert scanner.findings("POST companies/filter answered 200; 12 records") == []
 
+    def test_redacts_the_token_and_its_prefix(self) -> None:
+        scanner = SecretScanner(ApiToken(TOKEN))
+
+        redacted = scanner.redact(f"Bearer {TOKEN} then {TOKEN[:12]}")
+
+        assert TOKEN[:12] not in redacted
+        assert redacted == "Bearer *** then ***"
+
 
 class TestRecordLedger:
     def test_balanced_when_every_created_record_is_deleted(self) -> None:
@@ -125,7 +142,20 @@ class TestRecordLedger:
 
 
 class _Upstream(http.server.BaseHTTPRequestHandler):
+    """A stand-in API that records what reached it."""
+
+    received: list[tuple[str, str, bytes, str | None]] = []
+
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        self._answer()
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._answer()
+
+    def _answer(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        self.received.append((self.command, self.path, body, self.headers.get("Authorization")))
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -137,6 +167,7 @@ class _Upstream(http.server.BaseHTTPRequestHandler):
 
 @pytest.fixture
 def upstream() -> Iterator[str]:
+    _Upstream.received = []
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Upstream)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -152,5 +183,54 @@ class TestRateLimitProxy:
         assert [a.status_code for a in answers] == [429, 429, 200]
         assert answers[0].headers["Retry-After"] == "1"
         assert answers[2].json() == {"ok": True}
+        assert answers[2].headers.get_list("content-type") == ["application/json"]
         assert proxy.refused == 2
         assert proxy.forwarded == 1
+
+    def test_forwards_a_post_with_its_body_and_token(self, upstream: str) -> None:
+        with RateLimitProxy(upstream=upstream, refusals=0, retry_after_seconds=1) as proxy:
+            answer = httpx.post(
+                f"{proxy.url}/api/v1/companies/filter?page=2",
+                json={"filters": {}},
+                headers={"Authorization": f"Bearer {TOKEN}"},
+            )
+
+        assert answer.status_code == 200
+        [(method, path, body, authorization)] = _Upstream.received
+        assert (method, path, authorization) == ("POST", "/api/v1/companies/filter?page=2", f"Bearer {TOKEN}")
+        assert json.loads(body) == {"filters": {}}
+
+    @staticmethod
+    def _raw_get(proxy: RateLimitProxy, target: str) -> int:
+        """Send ``target`` as the request line verbatim (httpx would turn it into a path)."""
+        port = int(proxy.url.rsplit(":", 1)[1])
+        connection = http.client.HTTPConnection("127.0.0.1", port)
+        try:
+            connection.request("GET", target, headers={"Authorization": f"Bearer {TOKEN}"})
+            return connection.getresponse().status
+        finally:
+            connection.close()
+
+    def test_refuses_an_absolute_url_aimed_at_another_host(self, upstream: str) -> None:
+        with RateLimitProxy(upstream=upstream, refusals=0, retry_after_seconds=1) as proxy:
+            status = self._raw_get(proxy, "http://elsewhere.example/steal")
+
+        assert status == 400
+        assert _Upstream.received == []
+
+    def test_a_double_slash_path_stays_on_the_upstream(self, upstream: str) -> None:
+        # http.server folds a leading `//` into one `/`, so this is a path on the upstream, not a host.
+        with RateLimitProxy(upstream=upstream, refusals=0, retry_after_seconds=1) as proxy:
+            status = self._raw_get(proxy, "//elsewhere.example/steal")
+
+        assert status == 200
+        assert [path for _, path, _, _ in _Upstream.received] == ["/elsewhere.example/steal"]
+
+    def test_writes_its_counts_for_the_harness(self, upstream: str, tmp_path: Path) -> None:
+        stats = tmp_path / "stats.json"
+        with RateLimitProxy(upstream=upstream, refusals=1, retry_after_seconds=1, stats_path=stats) as proxy:
+            for _ in range(2):
+                httpx.get(f"{proxy.url}/companies/x")
+
+        assert json.loads(stats.read_text()) == {"refused": 1, "forwarded": 1}
+        assert list(tmp_path.iterdir()) == [stats]
