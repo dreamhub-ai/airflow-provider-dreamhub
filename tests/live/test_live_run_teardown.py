@@ -134,14 +134,14 @@ class TestUnfinishedRuns:
 
 
 class TestTearDown:
-    def test_reads_results_and_scans_logs_before_stopping_airflow_then_cleans_up(self, make_run) -> None:
+    def test_reads_results_before_stopping_airflow_and_scans_logs_after(self, make_run) -> None:
         airflow = FakeAirflow(files={f"{OUT_DIR}/bulk_create.ndjson": summary_line(["c1", "c2"])})
         run = make_run(airflow)
 
         report = run.tear_down()
 
         order = [call for call in airflow.calls if call in ("copy_logs", "halt", "clean_up")]
-        assert order == ["copy_logs", "halt", "clean_up"]
+        assert order == ["halt", "copy_logs", "clean_up"]
         assert airflow.calls.index("exists bulk_create.ndjson") < airflow.calls.index("halt")
         assert report["counts"] == {"companies": {"created": 2, "deleted": 2}}
         assert "problems" not in report
@@ -161,9 +161,9 @@ class TestTearDown:
         report = run.tear_down()
 
         assert report["problems"] == ["logs not scanned: DockerException"]
-        assert airflow.calls[-2:] == ["halt", "clean_up"]
+        assert airflow.calls[-3:] == ["halt", "copy_logs", "clean_up"]
 
-    def test_airflow_that_cannot_be_stopped_is_a_problem_and_cleanup_still_runs(self, make_run) -> None:
+    def test_airflow_that_cannot_be_stopped_is_a_problem_and_logs_and_cleanup_still_run(self, make_run) -> None:
         airflow = FakeAirflow()
         airflow.halt_error = DockerException(["docker", "stop"], 1)
         run = make_run(airflow)
@@ -171,7 +171,7 @@ class TestTearDown:
         report = run.tear_down()
 
         assert report["problems"] == ["Airflow not stopped, a run may still write: DockerException"]
-        assert airflow.calls[-1] == "clean_up"
+        assert airflow.calls[-3:] == ["halt", "copy_logs", "clean_up"]
 
     def test_a_results_line_that_is_not_an_object_is_a_problem(self, make_run) -> None:
         run = make_run(FakeAirflow(files={f"{OUT_DIR}/bulk_create.ndjson": "[1]\n"}))

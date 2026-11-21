@@ -203,12 +203,14 @@ class LiveRun:
     def tear_down(self) -> dict[str, object]:
         """End the run: count what the tasks reported, stop Airflow, then clean up whatever happened before.
 
-        Results are read while Airflow still runs (a stopped container cannot be read), so even a run
-        that timed out has its written ids counted. Airflow is stopped next, so nothing in flight writes
-        after the cleanup. Cleanup itself always runs: it needs only the API, not the container.
+        Results are read while Airflow still runs (they are read with `docker exec`, which needs a
+        running container), so even a run that timed out has its written ids counted. Airflow is stopped
+        next, so nothing in flight writes after the cleanup. Cleanup itself always runs: it needs only
+        the API, not the container.
 
-        The final logs are also scanned for the token here, so the check runs even when a failed or
-        filtered test run (``-x``, ``-k``) never reaches the dedicated test.
+        The logs are copied and scanned for the token after Airflow stops (`docker cp` and `docker logs`
+        read a stopped container), so a task still running at the scan cannot add an unscanned line.
+        This runs even when a failed or filtered test run (``-x``, ``-k``) never reaches the dedicated test.
 
         ``problems`` lists what failed or could not be confirmed (ids not read, the token found or the
         logs not scanned, Airflow not stopped); the caller fails the run on any of them.
@@ -220,17 +222,17 @@ class LiveRun:
         except (AirflowRunError, DockerException, ValueError) as error:
             problems.append(f"results not read: {type(error).__name__}")
         try:
+            self.airflow.halt()
+        except DockerException as error:
+            problems.append(f"Airflow not stopped, a run may still write: {type(error).__name__}")
+        try:
             if self.airflow.started:
                 self.collect_logs()
                 findings = self.token_findings()
                 if findings:
                     problems.append(f"token found in {len(findings)} log lines")
-        except Exception as error:  # noqa: BLE001 - any failure here must still leave halt and cleanup to run
+        except Exception as error:  # noqa: BLE001 - any failure here must still leave cleanup to run
             problems.append(f"logs not scanned: {type(error).__name__}")
-        try:
-            self.airflow.halt()
-        except DockerException as error:
-            problems.append(f"Airflow not stopped, a run may still write: {type(error).__name__}")
         report = self.clean_up()
         if problems:
             report["problems"] = problems
