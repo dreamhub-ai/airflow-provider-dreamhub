@@ -18,19 +18,25 @@ import pytest
 
 pytest.importorskip("python_on_whales", reason="the live harness needs the 'live' extra")
 
+from python_on_whales.exceptions import DockerException  # noqa: E402
+
 from tests.live.conftest import SUMMARY_KEY  # noqa: E402
 from tests.live.dags.live_records import CLEARED_FIELD, OUT_DIR  # noqa: E402
 from tests.live.harness.airflow_container import IMAGES, AirflowImage, AirflowRunError  # noqa: E402
 from tests.live.harness.config import ApiToken, HarnessConfigError, LiveTarget  # noqa: E402
 from tests.live.harness.live_api import LiveApi  # noqa: E402
-from tests.live.harness.live_run import PROXY_REFUSALS, PROXY_RETRY_AFTER_SECONDS, LiveRun  # noqa: E402
+from tests.live.harness.live_run import (  # noqa: E402
+    BULK_RESULTS,
+    PROXY_REFUSALS,
+    PROXY_RETRY_AFTER_SECONDS,
+    LiveRun,
+)
 
 pytestmark = pytest.mark.airflow_live
 
 ROOT = Path(__file__).resolve().parents[2]
 WANTED_MAJORS = {part.strip() for part in os.environ.get("DREAMHUB_LIVE_AIRFLOW", "2,3").split(",")}
 SELECTED_IMAGES = [image for image in IMAGES if str(image.major) in WANTED_MAJORS]
-BULK_RESULTS = ["bulk_create.ndjson", "bulk_update.ndjson", "bulk_upsert.ndjson", "bulk_overwrite.ndjson"]
 
 
 @pytest.fixture(scope="session")
@@ -105,12 +111,20 @@ def live_run(
                 try:
                     run.airflow.resume()
                     summary.append(run.airflow.ui_instructions())
-                except AirflowRunError as error:
-                    summary.append(f"{image.label}: the UI could not be restarted: {error}")
+                except (AirflowRunError, DockerException) as error:
+                    reason = type(error).__name__
+                    summary.append(
+                        f"{image.label}: the UI could not be restarted ({reason}); {run.airflow.removal_command()}"
+                    )
+            elif keep and run.airflow.started:
+                summary.append(f"{image.label}: Airflow never came up; {run.airflow.removal_command()}")
         finally:
             run.close()
     if report.get("leftovers") or report.get("still_readable"):
         pytest.fail(f"the live run left records behind: {json.dumps(report)}")
+    if report.get("problems"):
+        # Ids not read or Airflow not stopped: a record may exist that cleanup did not see.
+        pytest.fail(f"the live run could not confirm its cleanup: {json.dumps(report)}")
 
 
 def test_provider_is_installed_and_registered(live_run: LiveRun) -> None:

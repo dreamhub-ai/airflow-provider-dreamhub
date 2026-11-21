@@ -149,9 +149,11 @@ class AirflowContainer:
     def ui_instructions(self) -> str:
         return (
             f"Airflow {self.image.label} UI: http://127.0.0.1:{self.image.ui_port} "
-            f"(login: docker exec {self.name} cat {self.image.ui_password_file}); "
-            f"remove it with: docker rm -f {self.name}"
+            f"(login: docker exec {self.name} cat {self.image.ui_password_file}); {self.removal_command()}"
         )
+
+    def removal_command(self) -> str:
+        return f"remove it with: docker rm -f {self.name}"
 
     def _remove_stopped_leftovers(self) -> None:
         """Containers an interrupted earlier run left behind, stopped; a kept, running one is left alone."""

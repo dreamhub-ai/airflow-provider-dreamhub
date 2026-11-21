@@ -48,8 +48,10 @@ these DAGs through the Airflow scheduler:
 
 Every record a run writes carries the run's marker. When the run ends, the harness reads the ids the
 tasks reported as written, then stops Airflow so nothing still running can write afterwards. Every
-record those reports name, or that still reads back by the run's websites, is deleted and counted,
-and leftover records fail the run. No task log or container output may contain the token.
+record those reports name, or that still reads back by the run's websites, is deleted and counted.
+Leftover records fail the run, and so does a cleanup the harness could not confirm (the reported ids
+could not be read, or Airflow could not be stopped). No task log or container output may contain the
+token.
 
 If a run is killed before it can clean up, its records stay. The summary prints each run's marker
 (it starts with `airflow-live-`). The run's companies have websites starting with `https://<marker>-`
@@ -78,8 +80,8 @@ read-only `e2e` tests, because it writes and refuses every environment but the d
    .venv/bin/pytest -m airflow_live -v
    ```
    `DREAMHUB_LIVE_AIRFLOW=3` (or `2`) runs one Airflow version only.
-   `DREAMHUB_LIVE_LABELS=key=value,...` adds labels to the containers. The summary at the end lists each run's marker and cleanup
-   counts.
+   `DREAMHUB_LIVE_LABELS=key=value,...` adds labels to the containers. The summary at the end lists
+   each run's marker and cleanup counts.
 
 **See the runs in the Airflow UI.** Run with `DREAMHUB_LIVE_KEEP=1` and the containers stay up
 after the test (Airflow is stopped for the cleanup, then started again; an Airflow that never came up

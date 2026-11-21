@@ -8,6 +8,8 @@ from collections.abc import Generator
 from contextlib import contextmanager
 
 from dreamhub_airflow.entities import EntityRoute
+
+# The hook's own "nothing matches" reading, imported rather than copied so the two cannot drift apart.
 from dreamhub_airflow.hooks.dreamhub import _NOTHING_MATCHES, MAX_PAGE_SIZE, DreamhubHook, _ErrorBody
 from tests.live.harness.config import ApiToken, LiveTarget
 from tests.live.harness.ledger import RecordLedger

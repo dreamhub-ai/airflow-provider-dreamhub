@@ -35,13 +35,8 @@ DAG_IDS = [
 # A token the API refuses: same shape as a real one, so the refusal is the API's, not a format check.
 REFUSED_TOKEN = "pat_" + "0" * 40
 # Every results file a write task may leave in OUT_DIR, read before Airflow stops.
-WRITE_RESULTS = [
-    "bulk_create.ndjson",
-    "bulk_update.ndjson",
-    "bulk_upsert.ndjson",
-    "bulk_overwrite.ndjson",
-    "invalid_results.ndjson",
-]
+BULK_RESULTS = ["bulk_create.ndjson", "bulk_update.ndjson", "bulk_upsert.ndjson", "bulk_overwrite.ndjson"]
+WRITE_RESULTS = [*BULK_RESULTS, "invalid_results.ndjson"]
 
 
 class ConnectionEnvFile:
@@ -151,7 +146,12 @@ class LiveRun:
         if not self.airflow.file_exists(path):
             return None
         lines = self._scanner.redact(self.airflow.read_text(path)).splitlines()
-        return json.loads(lines[0]) if lines else None
+        if not lines:
+            return None
+        summary = json.loads(lines[0])
+        if not isinstance(summary, dict):
+            raise ValueError(f"{name}: the summary is not a JSON object")
+        return summary
 
     def succeeded_ids(self, name: str) -> set[str]:
         """The ids the bulk task that wrote ``{OUT_DIR}/{name}`` reports as succeeded (none if it wrote no file)."""
@@ -162,9 +162,15 @@ class LiveRun:
         return {str(record_id) for record_id in ids}
 
     def record_written(self, names: list[str]) -> set[str]:
-        """Count as created every id the named bulk results report as written; returns those ids."""
-        ids = set().union(*(self.succeeded_ids(name) for name in names))
-        self.ledger.created("companies", sorted(ids))
+        """Count as created every id the named bulk results report as written; returns those ids.
+
+        Each file is counted as soon as it is read, so a failure on a later one keeps the earlier ones.
+        """
+        ids: set[str] = set()
+        for name in names:
+            written = self.succeeded_ids(name)
+            self.ledger.created("companies", sorted(written))
+            ids |= written
         return ids
 
     def record_deleted(self, name: str) -> set[str]:
@@ -191,6 +197,9 @@ class LiveRun:
         Results are read while Airflow still runs (a stopped container cannot be read), so even a run
         that timed out has its written ids counted. Airflow is stopped next, so nothing in flight writes
         after the cleanup. Cleanup itself always runs: it needs only the API, not the container.
+
+        ``problems`` lists what could not be confirmed (ids not read, Airflow not stopped). Either one
+        means a record could exist that cleanup did not see, so the caller fails the run on it.
         """
         problems: list[str] = []
         try:
