@@ -107,7 +107,10 @@ def live_run(
             report = run.tear_down()
             summary.append(f"{image.label}: cleanup {json.dumps(report)}")
             # Only an Airflow that came up is worth restarting; after a failed start the error above stands.
-            if keep and run.airflow.ready:
+            if keep and run.airflow.ready and run.has_unfinished_runs:
+                # Restarting would let the scheduler finish that run's writes after the cleanup.
+                summary.append(f"{image.label}: not restarted, a run never finished; {run.airflow.removal_command()}")
+            elif keep and run.airflow.ready:
                 try:
                     run.airflow.resume()
                     summary.append(run.airflow.ui_instructions())

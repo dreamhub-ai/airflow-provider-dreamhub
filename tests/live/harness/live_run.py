@@ -104,6 +104,7 @@ class LiveRun:
             redact=self._scanner.redact,
         )
         self._runs = 0
+        self._unfinished: set[str] = set()
 
     def start(self) -> None:
         self.airflow.start(DAG_IDS)
@@ -112,8 +113,16 @@ class LiveRun:
         """Trigger ``dag_id`` with this run's marker and wait for it; returns (run_id, state)."""
         self._runs += 1
         run_id = f"{self.ledger.run_marker}-{self._runs}-{dag_id}"
+        self._unfinished.add(run_id)
         self.airflow.trigger(dag_id, run_id, {"run_marker": self.ledger.run_marker, "out_dir": OUT_DIR})
-        return run_id, self.airflow.wait_for_run(dag_id, run_id)
+        state = self.airflow.wait_for_run(dag_id, run_id)
+        self._unfinished.discard(run_id)
+        return run_id, state
+
+    @property
+    def has_unfinished_runs(self) -> bool:
+        """A triggered run never reached success or failed (a timeout or an interrupt)."""
+        return bool(self._unfinished)
 
     def start_rate_limit_proxy(self) -> None:
         self.airflow.run_in_background(

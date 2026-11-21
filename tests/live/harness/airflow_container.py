@@ -136,7 +136,11 @@ class AirflowContainer:
             docker.container.stop(self._container, time=STOP_TIMEOUT_SECONDS)
 
     def resume(self, timeout: float = 300) -> None:
-        """Start a halted, kept Airflow again so its UI can be opened. Unfinished runs end as failed."""
+        """Start a halted, kept Airflow again so its UI can be opened.
+
+        The scheduler would carry on any run that was unfinished when Airflow stopped, so callers only
+        resume after every triggered run has finished (see ``LiveRun.has_unfinished_runs``).
+        """
         docker.container.start(self.container)
         self._wait_for_dags(timeout)
 
