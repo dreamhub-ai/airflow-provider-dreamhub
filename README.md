@@ -21,7 +21,7 @@ pip install airflow-provider-dreamhub
 Or pin a release straight from GitHub:
 
 ```bash
-pip install "airflow-provider-dreamhub @ git+https://github.com/dreamhub-ai/airflow-provider-dreamhub@v0.1.0"
+pip install "airflow-provider-dreamhub @ git+https://github.com/dreamhub-ai/airflow-provider-dreamhub@v0.1.1"
 ```
 
 To write to S3 or GCS, also install the matching Airflow provider (`apache-airflow-providers-amazon` or
@@ -107,9 +107,9 @@ DreamhubBulkOperator(
 | `operation` | `create`, `update`, `upsert` or `delete` |
 | `records` / `input_path` | The records: a list of objects (e.g. `task.output` of an upstream task, or a JSON array rendered from XCom), or an NDJSON/CSV file. In CSV every value is text and an empty cell is null. |
 | `input_format` | `ndjson` (default) or `csv` |
-| `match_field` | For `update`, `upsert` and `delete`: find each record's Dreamhub id by this field instead of requiring an `id`. Values are compared as text, so `"42"` from a CSV file matches a stored `42`. A value no record holds fails that record (`update`, `delete`) or creates a new record (`upsert`); a value held by several records, or an empty value, fails that record. |
+| `match_field` | For `update`, `upsert` and `delete`: find each record's Dreamhub id by this field instead of requiring an `id`. Values are compared as text, so `"42"` from a CSV file matches a stored `42`. A value no record holds fails that record (`update`, `delete`) or creates a new record (`upsert`); a value held by several records, or an empty value, fails that record. An `upsert` with `match_field` updates each matched record with the values you send, as `update` does. |
 | `override` | `False` (default): a null in your data never clears a stored value. `True`: nulls are written. |
-| `match_existing` | `upsert` only. Records without an id are matched on Dreamhub's natural keys (email for people; domain and name for companies) before a new one is created. Default `True`. |
+| `match_existing` | `upsert` only. Records without an id are matched on Dreamhub's natural keys (email for people; domain and name for companies) before a new one is created. Default `True`. With `match_field`, this applies only to the records `match_field` did not match. |
 | `batch_size` | Records per API request, 1 to 500 (default 200) |
 | `fail_on_partial` | Fail the task when any record failed (default `True`) |
 | `results_path` | Also write the full result, with every failure and its reason, to this path |
@@ -129,8 +129,11 @@ results file, the task's return value and that `summary` like the data you load.
 
 Notes:
 
-- `upsert` with `override=False` fills only fields that are empty in Dreamhub; `update` with `override=False`
-  writes every non-null value you send.
+- `update` with `override=False` writes every non-null value you send. `upsert` without `match_field` follows
+  Dreamhub's upsert: with `override=False`, a record that has an `id` or that Dreamhub matches on its natural
+  keys gets only its empty fields filled; values already stored are kept. `upsert` with `match_field` sends the
+  records it matched as an `update` (so the values you send replace stored ones, and with `override=False` a
+  null still never clears one) and upserts only the records it did not match.
 - A request that may already have been applied is never resent automatically. If the run stops part-way,
   what was written and what failed before it stopped is logged and written to `results_path`, together with
   `unknown_positions` (records sent in the request in flight, which may or may not have been written) and
@@ -142,7 +145,8 @@ Notes:
   retried, since deleting a record twice is harmless; if it persists, the run stops with that record reported
   as unknown. Other errors fail just that record.
 - Records written before a task fails stay written. Running a `create` again creates them again, so for loads
-  that may be retried, use `upsert` with `match_field`: a second run updates the records the first run made.
+  that may be retried, use `upsert` with `match_field`: a second run updates the records the first run made
+  with the values it sends. An `upsert` without `match_field` would only fill their empty fields.
 - The task returns at most 100 failures and 1,000 ids; set `results_path` to keep the complete result.
 - `delete` is a soft delete, one request per record; `batch_size` and `override` do not apply to it.
 - When every record of a batch fails, Dreamhub reports one reason for the whole batch.

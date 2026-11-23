@@ -57,8 +57,11 @@ class DreamhubBulkOperator(BaseOperator):
         an ``id``. Values are compared as text, so ``"42"`` from a CSV file matches a stored
         ``42``. A value no record holds fails that record (``update``/``delete``) or creates
         a new one (``upsert``); a value several records hold, or an empty value, fails that record.
+        An ``upsert`` with ``match_field`` updates each matched record with the values sent, as
+        ``update`` does, and upserts only the records no Dreamhub record matched.
     :param override: False (default) never clears a stored value with a null. True writes
-        nulls over stored values.
+        nulls over stored values. An ``upsert`` without ``match_field`` keeps Dreamhub's own
+        upsert rule: with False, a record the API matches has only its empty fields filled.
     :param batch_size: Records per API request, 1 to 500 (default 200).
     :param fail_on_partial: Fail the task when any record failed (default True).
     :param results_path: Also write the full result, every failure and its reason included, to
@@ -128,14 +131,7 @@ class DreamhubBulkOperator(BaseOperator):
         try:
             if self.match_field:
                 records, positions, unmatched = self._attach_ids(hook, records)
-            result = hook.bulk(
-                self.entity,
-                self.operation,
-                records,
-                batch_size=self.batch_size,
-                override=self.override,
-                match_existing=self.match_existing,
-            )
+            result = self._write(hook, records)
         except BaseException as error:
             # Keep what was learned before the run stopped, in the caller's own positions. An error
             # is re-raised with those positions; Airflow stopping the task is re-raised unchanged.
@@ -190,7 +186,8 @@ class DreamhubBulkOperator(BaseOperator):
 
         Returns the records to send, the input position of each, and the failures of records
         that could not be matched. Failures name the input position, never the value, so match
-        values (often emails or account numbers) stay out of logs and task results.
+        values (often emails or account numbers) stay out of logs and task results. For an
+        upsert, the matched records come first and the new ones after them (see :meth:`_parts`).
         """
         field = self.match_field
         if field is None:
@@ -198,6 +195,8 @@ class DreamhubBulkOperator(BaseOperator):
         matches = hook.resolve_ids(self.entity, field, (r.get(field) for r in records))
         ready: list[Record] = []
         positions: list[int] = []
+        new: list[Record] = []
+        new_positions: list[int] = []
         failed: list[Record] = []
         for position, record in enumerate(records):
             key = hook.match_key(record.get(field))
@@ -212,11 +211,69 @@ class DreamhubBulkOperator(BaseOperator):
             elif self.operation == "upsert":
                 # No record holds the value, so this one is new. An id the caller sent along
                 # would make the API update that record instead; the match decides, not the id.
-                ready.append({k: v for k, v in record.items() if k != "id"})
-                positions.append(position)
+                new.append({k: v for k, v in record.items() if k != "id"})
+                new_positions.append(position)
             else:
                 failed.append({"key": position, "error": f"no record has this {field} value"})
-        return ready, positions, failed
+        return ready + new, positions + new_positions, failed
+
+    def _parts(self, records: list[Record]) -> list[tuple[str, list[Record]]]:
+        """The requests that write ``records``: each operation with its records, in the order given.
+
+        An upsert by ``match_field`` updates the records it matched and upserts only the new ones:
+        the API's upsert fills just the empty fields of an existing record, and a record the
+        pipeline matched itself is meant to take the values sent. :meth:`_attach_ids` puts the
+        matched records (those with an id) first.
+        """
+        if self.operation != "upsert" or not self.match_field:
+            return [(self.operation, records)]
+        matched = sum(1 for record in records if "id" in record)
+        parts = [("update", records[:matched]), ("upsert", records[matched:])]
+        return [(operation, part) for operation, part in parts if part]
+
+    def _write(self, hook: DreamhubHook, records: list[Record]) -> BulkResult:
+        """Write ``records`` and report by their positions in ``records``, whatever requests it took.
+
+        A run that stops in any request raises one report covering all of them: what earlier
+        requests wrote, what was in flight, and every record not yet attempted.
+        """
+        result = BulkResult(operation=self.operation)
+        offset = 0
+        for index, (operation, part) in enumerate(self._parts(records)):
+            in_records = list(range(offset, offset + len(part)))
+            try:
+                written = hook.bulk(
+                    self.entity,
+                    operation,
+                    part,
+                    batch_size=self.batch_size,
+                    override=self.override,
+                    match_existing=self.match_existing,
+                )
+            except BaseException as error:
+                partial = error if isinstance(error, DreamhubBulkError) else getattr(error, "dreamhub_partial", None)
+                if not isinstance(partial, DreamhubBulkError):
+                    if index == 0:
+                        raise
+                    # Stopped before this request reported anything; earlier requests did write.
+                    partial = DreamhubBulkError(BulkResult(operation=operation), [], list(range(len(part))), error)
+                self._add(result, partial.result, in_records)
+                DreamhubBulkError(
+                    result,
+                    [in_records[i] for i in partial.unknown],
+                    [in_records[i] for i in partial.not_attempted] + list(range(offset + len(part), len(records))),
+                    partial.cause,
+                ).propagate()
+            self._add(result, written, in_records)
+            offset += len(part)
+        return result
+
+    @classmethod
+    def _add(cls, result: BulkResult, part: BulkResult, in_records: list[int]) -> None:
+        """Add one request's outcome to ``result``, its position keys rewritten to ``in_records``."""
+        shifted = cls._in_input_terms(part, in_records, [])
+        result.succeeded_ids.extend(shifted.succeeded_ids)
+        result.failures.extend(shifted.failures)
 
     @staticmethod
     def _in_input_terms(result: BulkResult, positions: list[int], unmatched: list[Record]) -> BulkResult:
