@@ -483,3 +483,51 @@ class TestUpsertByMatchField:
         assert raised.value.result.succeeded_ids == ["c-1"]
         assert (raised.value.unknown, raised.value.not_attempted) == ([], [0])
         assert isinstance(raised.value.__cause__, RuntimeError)
+
+    @respx.mock
+    def test_unmatched_values_and_a_stop_in_the_upsert_are_reported_by_input_position(self):
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A"), ("c-2", "B"), ("c-3", "B")))
+        respx.put(f"{BASE_URL}/companies/bulk/update").mock(
+            return_value=httpx.Response(200, json={"successfulIds": ["c-1"], "errors": {}})
+        )
+        respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(
+            side_effect=[httpx.Response(201, json={"successfulIds": ["c-8"], "errors": {}}), httpx.Response(504)]
+        )
+
+        with pytest.raises(DreamhubBulkError) as raised:
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="upsert",
+                match_field="external_key",
+                batch_size=1,
+                records=[
+                    {"external_key": "A"},
+                    {"external_key": "B"},
+                    {"external_key": None},
+                    {"external_key": "N1"},
+                    {"external_key": "N2"},
+                ],
+            ).execute({})
+
+        # Input 0 updated, 1 ambiguous, 2 unusable, 3 created, 4 in flight.
+        assert raised.value.result.succeeded_ids == ["c-1", "c-8"]
+        assert raised.value.result.failures == [
+            {"key": 1, "error": "2 records have this external_key value"},
+            {"key": 2, "error": "record has no usable external_key value"},
+        ]
+        assert (raised.value.unknown, raised.value.not_attempted) == ([4], [])
+
+    @pytest.mark.parametrize("records", [[], [{"external_key": None}]])
+    def test_nothing_to_send_still_checks_the_connection(self, monkeypatch, records):
+        monkeypatch.setenv("AIRFLOW_CONN_DREAMHUB_NOTOKEN", json.dumps({"conn_type": "dreamhub", "host": BASE_URL}))
+
+        with pytest.raises(ValueError, match="no API token"):
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="upsert",
+                match_field="external_key",
+                dreamhub_conn_id="dreamhub_notoken",
+                records=records,
+            ).execute({})

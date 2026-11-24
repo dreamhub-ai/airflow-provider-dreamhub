@@ -128,10 +128,11 @@ class DreamhubBulkOperator(BaseOperator):
         hook = DreamhubHook(dreamhub_conn_id=self.dreamhub_conn_id)
         unmatched: list[Record] = []
         positions = list(range(len(records)))
+        matched: int | None = None
         try:
             if self.match_field:
-                records, positions, unmatched = self._attach_ids(hook, records)
-            result = self._write(hook, records)
+                records, positions, unmatched, matched = self._attach_ids(hook, records)
+            result = self._write(hook, records, matched)
         except BaseException as error:
             # Keep what was learned before the run stopped, in the caller's own positions. An error
             # is re-raised with those positions; Airflow stopping the task is re-raised unchanged.
@@ -181,17 +182,20 @@ class DreamhubBulkOperator(BaseOperator):
             raise TypeError("records must be a list of objects or a JSON array of objects")
         return list(records)
 
-    def _attach_ids(self, hook: DreamhubHook, records: list[Record]) -> tuple[list[Record], list[int], list[Record]]:
+    def _attach_ids(
+        self, hook: DreamhubHook, records: list[Record]
+    ) -> tuple[list[Record], list[int], list[Record], int]:
         """Give each record the id of the one Dreamhub record holding its ``match_field`` value.
 
-        Returns the records to send, the input position of each, and the failures of records
-        that could not be matched. Failures name the input position, never the value, so match
-        values (often emails or account numbers) stay out of logs and task results. For an
-        upsert, the matched records come first and the new ones after them (see :meth:`_parts`).
+        Returns the records to send, the input position of each, the failures of records that
+        could not be matched, and how many of the records to send were matched. The matched
+        records come first and, for an upsert, the new ones after them (see :meth:`_parts`).
+        Failures name the input position, never the value, so match values (often emails or
+        account numbers) stay out of logs and task results.
         """
         field = self.match_field
         if field is None:
-            return records, list(range(len(records))), []
+            return records, list(range(len(records))), [], len(records)
         matches = hook.resolve_ids(self.entity, field, (r.get(field) for r in records))
         ready: list[Record] = []
         positions: list[int] = []
@@ -215,31 +219,33 @@ class DreamhubBulkOperator(BaseOperator):
                 new_positions.append(position)
             else:
                 failed.append({"key": position, "error": f"no record has this {field} value"})
-        return ready + new, positions + new_positions, failed
+        return ready + new, positions + new_positions, failed, len(ready)
 
-    def _parts(self, records: list[Record]) -> list[tuple[str, list[Record]]]:
+    def _parts(self, records: list[Record], matched: int | None) -> list[tuple[str, list[Record]]]:
         """The requests that write ``records``: each operation with its records, in the order given.
 
         An upsert by ``match_field`` updates the records it matched and upserts only the new ones:
         the API's upsert fills just the empty fields of an existing record, and a record the
-        pipeline matched itself is meant to take the values sent. :meth:`_attach_ids` puts the
-        matched records (those with an id) first.
+        pipeline matched itself is meant to take the values sent. ``matched`` is the number of
+        matched records, which :meth:`_attach_ids` puts first.
         """
-        if self.operation != "upsert" or not self.match_field:
+        if self.operation != "upsert" or matched is None:
             return [(self.operation, records)]
-        matched = sum(1 for record in records if "id" in record)
         parts = [("update", records[:matched]), ("upsert", records[matched:])]
-        return [(operation, part) for operation, part in parts if part]
+        # With nothing to send, one empty request still runs the hook's checks (connection, entity),
+        # as it does for every other operation.
+        return [(operation, part) for operation, part in parts if part] or [(self.operation, records)]
 
-    def _write(self, hook: DreamhubHook, records: list[Record]) -> BulkResult:
+    def _write(self, hook: DreamhubHook, records: list[Record], matched: int | None) -> BulkResult:
         """Write ``records`` and report by their positions in ``records``, whatever requests it took.
 
+        ``matched`` is the number of leading records matched by ``match_field``, or None without it.
         A run that stops in any request raises one report covering all of them: what earlier
         requests wrote, what was in flight, and every record not yet attempted.
         """
         result = BulkResult(operation=self.operation)
         offset = 0
-        for index, (operation, part) in enumerate(self._parts(records)):
+        for index, (operation, part) in enumerate(self._parts(records, matched)):
             in_records = list(range(offset, offset + len(part)))
             try:
                 written = hook.bulk(

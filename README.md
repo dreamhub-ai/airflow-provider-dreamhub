@@ -133,7 +133,9 @@ Notes:
   Dreamhub's upsert: with `override=False`, a record that has an `id` or that Dreamhub matches on its natural
   keys gets only its empty fields filled; values already stored are kept. `upsert` with `match_field` sends the
   records it matched as an `update` (so the values you send replace stored ones, and with `override=False` a
-  null still never clears one) and upserts only the records it did not match.
+  null still never clears one) and upserts only the records it did not match. The update is sent first, so
+  `succeeded_ids` lists the matched records before the new ones, and a run that stops during the update
+  leaves every new record not attempted.
 - A request that may already have been applied is never resent automatically. If the run stops part-way,
   what was written and what failed before it stopped is logged and written to `results_path`, together with
   `unknown_positions` (records sent in the request in flight, which may or may not have been written) and
