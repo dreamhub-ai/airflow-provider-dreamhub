@@ -8,12 +8,14 @@ from importlib.metadata import entry_points
 import httpx
 import pytest
 import respx
+from airflow.exceptions import AirflowTaskTimeout
 
 from dreamhub_airflow.get_provider_info import get_provider_info
-from dreamhub_airflow.hooks.dreamhub import DreamhubHook
+from dreamhub_airflow.hooks.dreamhub import DreamhubBulkError, DreamhubHook
 from dreamhub_airflow.operators.api import DreamhubApiOperator
 from dreamhub_airflow.operators.bulk import DreamhubBulkOperator, DreamhubRecordsFailedError
 from dreamhub_airflow.operators.extract import DreamhubExtractOperator
+from dreamhub_airflow.records import JsonValue, Record
 from tests.helpers import BASE_URL
 
 
@@ -258,3 +260,284 @@ class TestProviderRegistration:
         assert info["connection-types"][0]["connection-type"] == "dreamhub"
         module, _, name = info["connection-types"][0]["hook-class-name"].rpartition(".")
         assert getattr(importlib.import_module(module), name) is DreamhubHook
+
+
+def _matched(*pairs: tuple[str, str]) -> httpx.Response:
+    """A companies filter page holding (id, externalKey) pairs."""
+    return _page("companies", [{"id": record_id, "externalKey": key} for record_id, key in pairs])
+
+
+def _company(key: str | None, **fields: JsonValue) -> Record:
+    """A company record for the upsert tests: its ``external_key`` (None for an unusable one) plus
+    any fields the scenario needs."""
+    return {"external_key": key, **fields}
+
+
+def _bulk_answer(*ids: str, errors: dict[str, str] | None = None, status: int | None = None) -> httpx.Response:
+    """A bulk endpoint's answer: the ids it wrote and its errors by key (HTTP 206 when there are errors)."""
+    errors = errors or {}
+    return httpx.Response(status or (206 if errors else 200), json={"successfulIds": list(ids), "errors": errors})
+
+
+class TestUpsertByMatchField:
+    """An upsert by match_field updates the records it matched and creates only the rest.
+
+    The API's own upsert fills just the empty fields of an existing record, so a matched record
+    sent through it would keep its old values.
+    """
+
+    @respx.mock
+    def test_matched_records_are_updated_and_only_new_ones_upserted(self):
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A")))
+        update = respx.put(f"{BASE_URL}/companies/bulk/update").mock(return_value=_bulk_answer("c-1"))
+        upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(return_value=_bulk_answer("c-9"))
+
+        summary = DreamhubBulkOperator(
+            task_id="load",
+            entity="companies",
+            operation="upsert",
+            match_field="external_key",
+            records=[_company("NEW", name="New Co"), _company("A", name="Acme", phone=None)],
+        ).execute({})
+
+        assert json.loads(update.calls[0].request.content) == [_company("A", name="Acme", phone=None, id="c-1")]
+        # The default override=False: values sent overwrite, a null never clears a stored value.
+        assert update.calls[0].request.url.params["override"] == "false"
+        assert json.loads(upsert.calls[0].request.content) == [_company("NEW", name="New Co")]
+        assert summary["operation"] == "upsert"
+        assert summary["succeeded_ids"] == ["c-1", "c-9"]
+        assert summary["failures"] == []
+
+    @respx.mock
+    def test_override_writes_nulls_over_matched_records(self):
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A")))
+        update = respx.put(f"{BASE_URL}/companies/bulk/update").mock(return_value=_bulk_answer("c-1"))
+        upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert")
+
+        DreamhubBulkOperator(
+            task_id="load",
+            entity="companies",
+            operation="upsert",
+            match_field="external_key",
+            override=True,
+            records=[_company("A", phone=None)],
+        ).execute({})
+
+        assert update.calls[0].request.url.params["override"] == "true"
+        assert upsert.call_count == 0
+
+    @respx.mock
+    def test_an_upsert_without_match_field_is_one_api_upsert(self):
+        upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(return_value=_bulk_answer("c-1", "c-2"))
+        update = respx.put(f"{BASE_URL}/companies/bulk/update")
+
+        DreamhubBulkOperator(
+            task_id="load",
+            entity="companies",
+            operation="upsert",
+            records=[{"id": "c-1", "name": "Acme"}, {"name": "Beta"}],
+        ).execute({})
+
+        assert json.loads(upsert.calls[0].request.content) == [{"id": "c-1", "name": "Acme"}, {"name": "Beta"}]
+        assert upsert.calls[0].request.url.params["override"] == "false"
+        assert update.call_count == 0
+
+    @respx.mock
+    def test_failures_from_both_requests_are_keyed_in_the_callers_input(self):
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A"), ("c-2", "B")))
+        respx.put(f"{BASE_URL}/companies/bulk/update").mock(
+            return_value=_bulk_answer("c-2", errors={"c-1": "stage is invalid"})
+        )
+        respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(
+            return_value=_bulk_answer("c-9", errors={"create_1": "name required"})
+        )
+
+        summary = DreamhubBulkOperator(
+            task_id="load",
+            entity="companies",
+            operation="upsert",
+            match_field="external_key",
+            fail_on_partial=False,
+            records=[_company("N1", name="One"), _company("A"), _company("N2"), _company("B")],
+        ).execute({})
+
+        assert summary["succeeded_ids"] == ["c-2", "c-9"]
+        # The second new record (input 2) is named by the batch the API saw, in input terms: the
+        # upsert carried inputs 0 and 2, so its batch starts at input 0.
+        assert summary["failures"] == [
+            {"key": "c-1", "error": "stage is invalid"},
+            {"key": "new record 1 of the batch starting at 0", "error": "name required"},
+        ]
+
+    @respx.mock
+    def test_a_stop_in_the_update_leaves_the_new_records_not_attempted(self, tmp_path):
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A"), ("c-2", "B")))
+        respx.put(f"{BASE_URL}/companies/bulk/update").mock(side_effect=[_bulk_answer("c-1"), httpx.Response(504)])
+        upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert")
+        results = tmp_path / "results.ndjson"
+
+        with pytest.raises(DreamhubBulkError) as raised:
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="upsert",
+                match_field="external_key",
+                batch_size=1,
+                results_path=str(results),
+                records=[_company("NEW"), _company("A"), _company("B")],
+            ).execute({})
+
+        assert upsert.call_count == 0
+        assert raised.value.result.succeeded_ids == ["c-1"]
+        # Input 1 written, input 2 in flight, input 0 (new) never sent.
+        assert (raised.value.unknown, raised.value.not_attempted) == ([2], [0])
+        written = _lines(results)[0]
+        assert (written["unknown_positions"], written["not_attempted_positions"]) == ([2], [0])
+
+    @respx.mock
+    def test_a_stop_in_the_upsert_still_reports_what_the_update_wrote(self, tmp_path):
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A")))
+        respx.put(f"{BASE_URL}/companies/bulk/update").mock(return_value=_bulk_answer("c-1"))
+        respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(
+            side_effect=[_bulk_answer("c-8", status=201), httpx.Response(504)]
+        )
+        results = tmp_path / "results.ndjson"
+
+        with pytest.raises(DreamhubBulkError) as raised:
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="upsert",
+                match_field="external_key",
+                batch_size=1,
+                results_path=str(results),
+                records=[_company("N1"), _company("A"), _company("N2"), _company("N3")],
+            ).execute({})
+
+        assert raised.value.result.succeeded_ids == ["c-1", "c-8"]
+        # Inputs 1 (update) and 0 (first new) written, 2 in flight, 3 never sent.
+        assert (raised.value.unknown, raised.value.not_attempted) == ([2], [3])
+        assert "2 records were written" in str(raised.value)
+        written = _lines(results)[0]
+        assert written["succeeded_ids"] == ["c-1", "c-8"]
+
+    @respx.mock
+    def test_a_timeout_in_the_upsert_keeps_airflows_exception_and_the_whole_report(self, tmp_path):
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A")))
+        respx.put(f"{BASE_URL}/companies/bulk/update").mock(return_value=_bulk_answer("c-1"))
+
+        def timeout(request):
+            raise AirflowTaskTimeout("execution_timeout reached")
+
+        respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(side_effect=timeout)
+        results = tmp_path / "results.ndjson"
+
+        with pytest.raises(AirflowTaskTimeout) as raised:
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="upsert",
+                match_field="external_key",
+                results_path=str(results),
+                records=[_company("N1"), _company("A")],
+            ).execute({})
+
+        partial = raised.value.dreamhub_partial
+        assert partial.result.succeeded_ids == ["c-1"]
+        assert (partial.unknown, partial.not_attempted) == ([0], [])
+        written = _lines(results)[0]
+        assert (written["succeeded_ids"], written["unknown_positions"]) == (["c-1"], [0])
+
+    @respx.mock
+    def test_an_error_before_the_upsert_sends_anything_still_reports_the_update(self, monkeypatch):
+        # Also the path a stop between the two requests takes: nothing after the update was sent.
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A")))
+        respx.put(f"{BASE_URL}/companies/bulk/update").mock(return_value=_bulk_answer("c-1"))
+        bulk = DreamhubHook.bulk
+
+        def refuse_upsert(self, entity, operation, records, **kwargs):
+            if operation == "upsert":
+                raise RuntimeError("connection lost")
+            return bulk(self, entity, operation, records, **kwargs)
+
+        monkeypatch.setattr(DreamhubHook, "bulk", refuse_upsert)
+
+        with pytest.raises(DreamhubBulkError) as raised:
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="upsert",
+                match_field="external_key",
+                records=[_company("N1"), _company("A")],
+            ).execute({})
+
+        assert raised.value.result.succeeded_ids == ["c-1"]
+        assert (raised.value.unknown, raised.value.not_attempted) == ([], [0])
+        assert isinstance(raised.value.__cause__, RuntimeError)
+
+    @respx.mock
+    def test_a_timeout_with_no_report_leaves_the_running_records_unknown(self, monkeypatch):
+        # Airflow can stop the task right after a request returned, before its result was kept;
+        # whether it was written is then unknown, so its records must not read as not attempted.
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A")))
+        upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert")
+
+        def timeout(self, entity, operation, records, **kwargs):
+            raise AirflowTaskTimeout("execution_timeout reached")
+
+        monkeypatch.setattr(DreamhubHook, "bulk", timeout)
+
+        with pytest.raises(AirflowTaskTimeout) as raised:
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="upsert",
+                match_field="external_key",
+                records=[_company("N1"), _company("A")],
+            ).execute({})
+
+        partial = raised.value.dreamhub_partial
+        assert partial.result.succeeded_ids == []
+        # Input 1 (matched, in the update) is unknown; input 0 (new) was never sent.
+        assert (partial.unknown, partial.not_attempted) == ([1], [0])
+        assert upsert.call_count == 0
+
+    @respx.mock
+    def test_ambiguous_and_unusable_values_and_a_stop_in_the_upsert_are_reported_by_input_position(self):
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A"), ("c-2", "B"), ("c-3", "B")))
+        respx.put(f"{BASE_URL}/companies/bulk/update").mock(return_value=_bulk_answer("c-1"))
+        respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(
+            side_effect=[_bulk_answer("c-8", status=201), httpx.Response(504)]
+        )
+
+        with pytest.raises(DreamhubBulkError) as raised:
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="upsert",
+                match_field="external_key",
+                batch_size=1,
+                records=[_company("A"), _company("B"), _company(None), _company("N1"), _company("N2")],
+            ).execute({})
+
+        # Input 0 updated, 1 ambiguous, 2 unusable, 3 created, 4 in flight.
+        assert raised.value.result.succeeded_ids == ["c-1", "c-8"]
+        assert raised.value.result.failures == [
+            {"key": 1, "error": "2 records have this external_key value"},
+            {"key": 2, "error": "record has no usable external_key value"},
+        ]
+        assert (raised.value.unknown, raised.value.not_attempted) == ([4], [])
+
+    @pytest.mark.parametrize("records", [[], [_company(None)]])
+    def test_nothing_to_send_still_checks_the_connection(self, monkeypatch, records):
+        monkeypatch.setenv("AIRFLOW_CONN_DREAMHUB_NOTOKEN", json.dumps({"conn_type": "dreamhub", "host": BASE_URL}))
+
+        with pytest.raises(ValueError, match="no API token"):
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="upsert",
+                match_field="external_key",
+                dreamhub_conn_id="dreamhub_notoken",
+                records=records,
+            ).execute({})

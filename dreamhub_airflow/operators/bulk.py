@@ -57,8 +57,11 @@ class DreamhubBulkOperator(BaseOperator):
         an ``id``. Values are compared as text, so ``"42"`` from a CSV file matches a stored
         ``42``. A value no record holds fails that record (``update``/``delete``) or creates
         a new one (``upsert``); a value several records hold, or an empty value, fails that record.
+        An ``upsert`` with ``match_field`` updates each matched record with the values sent, as
+        ``update`` does, and upserts only the records no Dreamhub record matched.
     :param override: False (default) never clears a stored value with a null. True writes
-        nulls over stored values.
+        nulls over stored values. An ``upsert`` without ``match_field`` keeps Dreamhub's own
+        upsert rule: with False, a record the API matches has only its empty fields filled.
     :param batch_size: Records per API request, 1 to 500 (default 200).
     :param fail_on_partial: Fail the task when any record failed (default True).
     :param results_path: Also write the full result, every failure and its reason included, to
@@ -125,17 +128,11 @@ class DreamhubBulkOperator(BaseOperator):
         hook = DreamhubHook(dreamhub_conn_id=self.dreamhub_conn_id)
         unmatched: list[Record] = []
         positions = list(range(len(records)))
+        matched: int | None = None
         try:
             if self.match_field:
-                records, positions, unmatched = self._attach_ids(hook, records)
-            result = hook.bulk(
-                self.entity,
-                self.operation,
-                records,
-                batch_size=self.batch_size,
-                override=self.override,
-                match_existing=self.match_existing,
-            )
+                records, positions, unmatched, matched = self._attach_ids(hook, records)
+            result = self._write(hook, records, matched)
         except BaseException as error:
             # Keep what was learned before the run stopped, in the caller's own positions. An error
             # is re-raised with those positions; Airflow stopping the task is re-raised unchanged.
@@ -185,19 +182,25 @@ class DreamhubBulkOperator(BaseOperator):
             raise TypeError("records must be a list of objects or a JSON array of objects")
         return list(records)
 
-    def _attach_ids(self, hook: DreamhubHook, records: list[Record]) -> tuple[list[Record], list[int], list[Record]]:
+    def _attach_ids(
+        self, hook: DreamhubHook, records: list[Record]
+    ) -> tuple[list[Record], list[int], list[Record], int]:
         """Give each record the id of the one Dreamhub record holding its ``match_field`` value.
 
-        Returns the records to send, the input position of each, and the failures of records
-        that could not be matched. Failures name the input position, never the value, so match
-        values (often emails or account numbers) stay out of logs and task results.
+        Returns the records to send, the input position of each, the failures of records that
+        could not be matched, and how many of the records to send were matched. The matched
+        records come first and, for an upsert, the new ones after them (see :meth:`_parts`).
+        Failures name the input position, never the value, so match values (often emails or
+        account numbers) stay out of logs and task results.
         """
         field = self.match_field
         if field is None:
-            return records, list(range(len(records))), []
+            return records, list(range(len(records))), [], len(records)
         matches = hook.resolve_ids(self.entity, field, (r.get(field) for r in records))
         ready: list[Record] = []
         positions: list[int] = []
+        new: list[Record] = []
+        new_positions: list[int] = []
         failed: list[Record] = []
         for position, record in enumerate(records):
             key = hook.match_key(record.get(field))
@@ -212,11 +215,95 @@ class DreamhubBulkOperator(BaseOperator):
             elif self.operation == "upsert":
                 # No record holds the value, so this one is new. An id the caller sent along
                 # would make the API update that record instead; the match decides, not the id.
-                ready.append({k: v for k, v in record.items() if k != "id"})
-                positions.append(position)
+                new.append({k: v for k, v in record.items() if k != "id"})
+                new_positions.append(position)
             else:
                 failed.append({"key": position, "error": f"no record has this {field} value"})
-        return ready, positions, failed
+        return ready + new, positions + new_positions, failed, len(ready)
+
+    def _parts(self, records: list[Record], matched: int | None) -> list[tuple[str, list[Record]]]:
+        """The requests that write ``records``: each operation with its records, in the order given.
+
+        An upsert by ``match_field`` updates the records it matched and upserts only the new ones:
+        the API's upsert fills just the empty fields of an existing record, and a record the
+        pipeline matched itself is meant to take the values sent. ``matched`` is the number of
+        matched records, which :meth:`_attach_ids` puts first.
+        """
+        if self.operation != "upsert" or matched is None:
+            return [(self.operation, records)]
+        parts = [("update", records[:matched]), ("upsert", records[matched:])]
+        # With nothing to send, one empty request still runs the hook's checks (connection, entity),
+        # as it does for every other operation.
+        return [(operation, part) for operation, part in parts if part] or [(self.operation, records)]
+
+    def _write(self, hook: DreamhubHook, records: list[Record], matched: int | None) -> BulkResult:
+        """Write ``records`` and report by their positions in ``records``, whatever requests it took.
+
+        ``matched`` is the number of leading records matched by ``match_field``, or None without it.
+        A run that stops after a request started, in a request or between two of them (an Airflow
+        timeout can land at any statement), raises one report covering all of them: what finished
+        requests wrote, the records whose outcome is unknown, and every record not yet attempted.
+        When Airflow stops the task without a report from the hook, the running request's records
+        are reported as unknown, since it may already have been written.
+        """
+        # Each finished request is recorded the moment it returns, so a stop at any later point
+        # still reports it; positions come from these records, never from a separate counter.
+        done: list[tuple[BulkResult, list[int]]] = []
+        in_flight: list[int] = []
+        try:
+            for operation, part in self._parts(records, matched):
+                start = sum(len(positions) for _, positions in done)
+                in_flight = list(range(start, start + len(part)))
+                written = hook.bulk(
+                    self.entity,
+                    operation,
+                    part,
+                    batch_size=self.batch_size,
+                    override=self.override,
+                    match_existing=self.match_existing,
+                )
+                done.append((written, in_flight))
+            return self._merge(done)
+        except BaseException as error:
+            partial = error if isinstance(error, DreamhubBulkError) else getattr(error, "dreamhub_partial", None)
+            finished = sum(len(positions) for _, positions in done)
+            # The request that was running when the stop hit, unless it had already been recorded.
+            running = [] if done and done[-1][1] is in_flight else in_flight
+            result = self._merge(done)
+            if isinstance(partial, DreamhubBulkError):
+                # The running request reported what it wrote before it stopped.
+                self._add(result, partial.result, running)
+                unknown = [running[i] for i in partial.unknown]
+                not_attempted = [running[i] for i in partial.not_attempted]
+                cause = partial.cause
+            elif isinstance(error, Exception):
+                # The hook reports every error raised after it sent a batch, so a bare error means
+                # the running request sent nothing.
+                if not done:
+                    raise  # nothing was written at all: there is nothing to report
+                unknown, not_attempted, cause = [], list(running), error
+            else:
+                # Airflow stopped the task (a timeout or a kill) with no report from the hook: the
+                # running request may already have been written, so its records are unknown.
+                if not done and not running:
+                    raise  # stopped before any request started: there is nothing to report
+                unknown, not_attempted, cause = list(running), [], error
+            not_attempted += list(range(finished + len(running), len(records)))
+            DreamhubBulkError(result, unknown, not_attempted, cause).propagate()
+
+    def _merge(self, done: list[tuple[BulkResult, list[int]]]) -> BulkResult:
+        """One result for every finished request, position keys rewritten to the records list."""
+        result = BulkResult(operation=self.operation)
+        for written, positions in done:
+            self._add(result, written, positions)
+        return result
+
+    @classmethod
+    def _add(cls, result: BulkResult, part: BulkResult, in_records: list[int]) -> None:
+        """Add one request's outcome to ``result``, its position keys rewritten to ``in_records``."""
+        shifted = cls._in_input_terms(part, in_records, [])
+        result.succeeded_ids.extend(shifted.succeeded_ids)
+        result.failures.extend(shifted.failures)
 
     @staticmethod
     def _in_input_terms(result: BulkResult, positions: list[int], unmatched: list[Record]) -> BulkResult:

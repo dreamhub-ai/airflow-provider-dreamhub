@@ -5,7 +5,9 @@ harness on the host, so both sides agree on every record without passing ids aro
 
 What each bulk step leaves behind, so the final read shows every step's effect:
 
-- company 0: created, updated, then upserted (matched by website);
+- company 0: created, updated, then upserted (matched by website), which updates it: the upsert's
+  matched records go through bulk update, so its new name replaces the stored one (Dreamhub's own
+  upsert would only fill empty fields);
 - company 1: created, then updated with a null phone and the default ``override=False``, so the
   stored phone must survive;
 - company 2: created, updated, then written with ``override=True`` and a null phone, which clears it;
@@ -65,7 +67,7 @@ class CompanyFixture:
         return records
 
     def to_upsert(self) -> Records:
-        """Company 0, matched by website, and company 3, which no company matches, so it is created."""
+        """Company 0, matched by website and so updated, and company 3, which no company matches, so it is created."""
         return [self._company(0, "upserted"), self._company(COMPANY_COUNT, "upserted")]
 
     def to_overwrite(self) -> Records:
