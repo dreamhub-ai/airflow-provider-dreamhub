@@ -328,11 +328,15 @@ class TestUpsertByMatchField:
     def test_an_upsert_without_match_field_is_one_api_upsert(self):
         upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(return_value=_bulk_answer("c-1", "c-2"))
         update = respx.put(f"{BASE_URL}/companies/bulk/update")
-        records = [{"id": "c-1", "name": "Acme"}, {"name": "Beta"}]
 
-        DreamhubBulkOperator(task_id="load", entity="companies", operation="upsert", records=records).execute({})
+        DreamhubBulkOperator(
+            task_id="load",
+            entity="companies",
+            operation="upsert",
+            records=[{"id": "c-1", "name": "Acme"}, {"name": "Beta"}],
+        ).execute({})
 
-        assert json.loads(upsert.calls[0].request.content) == records
+        assert json.loads(upsert.calls[0].request.content) == [{"id": "c-1", "name": "Acme"}, {"name": "Beta"}]
         assert upsert.calls[0].request.url.params["override"] == "false"
         assert update.call_count == 0
 
