@@ -240,14 +240,18 @@ class DreamhubBulkOperator(BaseOperator):
         """Write ``records`` and report by their positions in ``records``, whatever requests it took.
 
         ``matched`` is the number of leading records matched by ``match_field``, or None without it.
-        A run that stops in any request raises one report covering all of them: what earlier
-        requests wrote, what was in flight, and every record not yet attempted.
+        A run that stops anywhere, in a request or between two of them (an Airflow timeout can
+        land at any statement), raises one report covering all of them: what earlier requests
+        wrote, what was in flight, and every record not yet attempted.
         """
-        result = BulkResult(operation=self.operation)
-        offset = 0
-        for index, (operation, part) in enumerate(self._parts(records, matched)):
-            in_records = list(range(offset, offset + len(part)))
-            try:
+        # Each finished request is recorded the moment it returns, so a stop at any later point
+        # still reports it; positions come from these records, never from a separate counter.
+        done: list[tuple[BulkResult, list[int]]] = []
+        in_flight: list[int] = []
+        try:
+            for operation, part in self._parts(records, matched):
+                start = sum(len(positions) for _, positions in done)
+                in_flight = list(range(start, start + len(part)))
                 written = hook.bulk(
                     self.entity,
                     operation,
@@ -256,22 +260,32 @@ class DreamhubBulkOperator(BaseOperator):
                     override=self.override,
                     match_existing=self.match_existing,
                 )
-            except BaseException as error:
-                partial = error if isinstance(error, DreamhubBulkError) else getattr(error, "dreamhub_partial", None)
-                if not isinstance(partial, DreamhubBulkError):
-                    if index == 0:
-                        raise
-                    # Stopped before this request reported anything; earlier requests did write.
-                    partial = DreamhubBulkError(BulkResult(operation=operation), [], list(range(len(part))), error)
-                self._add(result, partial.result, in_records)
-                DreamhubBulkError(
-                    result,
-                    [in_records[i] for i in partial.unknown],
-                    [in_records[i] for i in partial.not_attempted] + list(range(offset + len(part), len(records))),
-                    partial.cause,
-                ).propagate()
-            self._add(result, written, in_records)
-            offset += len(part)
+                done.append((written, in_flight))
+            return self._merge(done)
+        except BaseException as error:
+            partial = error if isinstance(error, DreamhubBulkError) else getattr(error, "dreamhub_partial", None)
+            if not isinstance(partial, DreamhubBulkError) and not done:
+                raise  # stopped before anything was sent: there is nothing to report
+            result = self._merge(done)
+            sent = sum(len(positions) for _, positions in done)
+            if isinstance(partial, DreamhubBulkError):
+                # The request in flight reported what it wrote before it stopped.
+                self._add(result, partial.result, in_flight)
+                unknown = [in_flight[i] for i in partial.unknown]
+                not_attempted = [in_flight[i] for i in partial.not_attempted]
+                not_attempted += list(range(sent + len(in_flight), len(records)))
+                cause = partial.cause
+            else:
+                # Stopped between requests, or in one before it sent anything: nothing after the
+                # finished requests was written.
+                unknown, not_attempted, cause = [], list(range(sent, len(records))), error
+            DreamhubBulkError(result, unknown, not_attempted, cause).propagate()
+
+    def _merge(self, done: list[tuple[BulkResult, list[int]]]) -> BulkResult:
+        """One result for every finished request, position keys rewritten to the records list."""
+        result = BulkResult(operation=self.operation)
+        for written, positions in done:
+            self._add(result, written, positions)
         return result
 
     @classmethod

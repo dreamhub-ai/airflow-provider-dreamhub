@@ -266,6 +266,17 @@ def _matched(*pairs):
     return _page("companies", [{"id": record_id, "externalKey": key} for record_id, key in pairs])
 
 
+def _company(key, **fields):
+    """A company record for the upsert tests: its ``external_key`` plus any fields the scenario needs."""
+    return {"external_key": key, **fields}
+
+
+def _bulk_answer(*ids, errors=None, status=None):
+    """A bulk endpoint's answer: the ids it wrote and its errors by key (HTTP 206 when there are errors)."""
+    errors = errors or {}
+    return httpx.Response(status or (206 if errors else 200), json={"successfulIds": list(ids), "errors": errors})
+
+
 class TestUpsertByMatchField:
     """An upsert by match_field updates the records it matched and creates only the rest.
 
@@ -276,27 +287,21 @@ class TestUpsertByMatchField:
     @respx.mock
     def test_matched_records_are_updated_and_only_new_ones_upserted(self):
         respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A")))
-        update = respx.put(f"{BASE_URL}/companies/bulk/update").mock(
-            return_value=httpx.Response(200, json={"successfulIds": ["c-1"], "errors": {}})
-        )
-        upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(
-            return_value=httpx.Response(200, json={"successfulIds": ["c-9"], "errors": {}})
-        )
+        update = respx.put(f"{BASE_URL}/companies/bulk/update").mock(return_value=_bulk_answer("c-1"))
+        upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(return_value=_bulk_answer("c-9"))
 
         summary = DreamhubBulkOperator(
             task_id="load",
             entity="companies",
             operation="upsert",
             match_field="external_key",
-            records=[{"external_key": "NEW", "name": "New Co"}, {"external_key": "A", "name": "Acme", "phone": None}],
+            records=[_company("NEW", name="New Co"), _company("A", name="Acme", phone=None)],
         ).execute({})
 
-        assert json.loads(update.calls[0].request.content) == [
-            {"external_key": "A", "name": "Acme", "phone": None, "id": "c-1"}
-        ]
+        assert json.loads(update.calls[0].request.content) == [_company("A", name="Acme", phone=None, id="c-1")]
         # The default override=False: values sent overwrite, a null never clears a stored value.
         assert update.calls[0].request.url.params["override"] == "false"
-        assert json.loads(upsert.calls[0].request.content) == [{"external_key": "NEW", "name": "New Co"}]
+        assert json.loads(upsert.calls[0].request.content) == [_company("NEW", name="New Co")]
         assert summary["operation"] == "upsert"
         assert summary["succeeded_ids"] == ["c-1", "c-9"]
         assert summary["failures"] == []
@@ -304,9 +309,7 @@ class TestUpsertByMatchField:
     @respx.mock
     def test_override_writes_nulls_over_matched_records(self):
         respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A")))
-        update = respx.put(f"{BASE_URL}/companies/bulk/update").mock(
-            return_value=httpx.Response(200, json={"successfulIds": ["c-1"], "errors": {}})
-        )
+        update = respx.put(f"{BASE_URL}/companies/bulk/update").mock(return_value=_bulk_answer("c-1"))
         upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert")
 
         DreamhubBulkOperator(
@@ -315,7 +318,7 @@ class TestUpsertByMatchField:
             operation="upsert",
             match_field="external_key",
             override=True,
-            records=[{"external_key": "A", "phone": None}],
+            records=[_company("A", phone=None)],
         ).execute({})
 
         assert update.calls[0].request.url.params["override"] == "true"
@@ -323,19 +326,13 @@ class TestUpsertByMatchField:
 
     @respx.mock
     def test_an_upsert_without_match_field_is_one_api_upsert(self):
-        upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(
-            return_value=httpx.Response(200, json={"successfulIds": ["c-1", "c-2"], "errors": {}})
-        )
+        upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(return_value=_bulk_answer("c-1", "c-2"))
         update = respx.put(f"{BASE_URL}/companies/bulk/update")
+        records = [{"id": "c-1", "name": "Acme"}, {"name": "Beta"}]
 
-        DreamhubBulkOperator(
-            task_id="load",
-            entity="companies",
-            operation="upsert",
-            records=[{"id": "c-1", "name": "Acme"}, {"name": "Beta"}],
-        ).execute({})
+        DreamhubBulkOperator(task_id="load", entity="companies", operation="upsert", records=records).execute({})
 
-        assert json.loads(upsert.calls[0].request.content) == [{"id": "c-1", "name": "Acme"}, {"name": "Beta"}]
+        assert json.loads(upsert.calls[0].request.content) == records
         assert upsert.calls[0].request.url.params["override"] == "false"
         assert update.call_count == 0
 
@@ -343,10 +340,10 @@ class TestUpsertByMatchField:
     def test_failures_from_both_requests_are_keyed_in_the_callers_input(self):
         respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A"), ("c-2", "B")))
         respx.put(f"{BASE_URL}/companies/bulk/update").mock(
-            return_value=httpx.Response(206, json={"successfulIds": ["c-2"], "errors": {"c-1": "stage is invalid"}})
+            return_value=_bulk_answer("c-2", errors={"c-1": "stage is invalid"})
         )
         respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(
-            return_value=httpx.Response(206, json={"successfulIds": ["c-9"], "errors": {"create_1": "name required"}})
+            return_value=_bulk_answer("c-9", errors={"create_1": "name required"})
         )
 
         summary = DreamhubBulkOperator(
@@ -355,12 +352,7 @@ class TestUpsertByMatchField:
             operation="upsert",
             match_field="external_key",
             fail_on_partial=False,
-            records=[
-                {"external_key": "N1", "name": "One"},
-                {"external_key": "A"},
-                {"external_key": "N2"},
-                {"external_key": "B"},
-            ],
+            records=[_company("N1", name="One"), _company("A"), _company("N2"), _company("B")],
         ).execute({})
 
         assert summary["succeeded_ids"] == ["c-2", "c-9"]
@@ -374,9 +366,7 @@ class TestUpsertByMatchField:
     @respx.mock
     def test_a_stop_in_the_update_leaves_the_new_records_not_attempted(self, tmp_path):
         respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A"), ("c-2", "B")))
-        respx.put(f"{BASE_URL}/companies/bulk/update").mock(
-            side_effect=[httpx.Response(200, json={"successfulIds": ["c-1"], "errors": {}}), httpx.Response(504)]
-        )
+        respx.put(f"{BASE_URL}/companies/bulk/update").mock(side_effect=[_bulk_answer("c-1"), httpx.Response(504)])
         upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert")
         results = tmp_path / "results.ndjson"
 
@@ -388,7 +378,7 @@ class TestUpsertByMatchField:
                 match_field="external_key",
                 batch_size=1,
                 results_path=str(results),
-                records=[{"external_key": "NEW"}, {"external_key": "A"}, {"external_key": "B"}],
+                records=[_company("NEW"), _company("A"), _company("B")],
             ).execute({})
 
         assert upsert.call_count == 0
@@ -401,11 +391,9 @@ class TestUpsertByMatchField:
     @respx.mock
     def test_a_stop_in_the_upsert_still_reports_what_the_update_wrote(self, tmp_path):
         respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A")))
-        respx.put(f"{BASE_URL}/companies/bulk/update").mock(
-            return_value=httpx.Response(200, json={"successfulIds": ["c-1"], "errors": {}})
-        )
+        respx.put(f"{BASE_URL}/companies/bulk/update").mock(return_value=_bulk_answer("c-1"))
         respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(
-            side_effect=[httpx.Response(201, json={"successfulIds": ["c-8"], "errors": {}}), httpx.Response(504)]
+            side_effect=[_bulk_answer("c-8", status=201), httpx.Response(504)]
         )
         results = tmp_path / "results.ndjson"
 
@@ -417,7 +405,7 @@ class TestUpsertByMatchField:
                 match_field="external_key",
                 batch_size=1,
                 results_path=str(results),
-                records=[{"external_key": "N1"}, {"external_key": "A"}, {"external_key": "N2"}, {"external_key": "N3"}],
+                records=[_company("N1"), _company("A"), _company("N2"), _company("N3")],
             ).execute({})
 
         assert raised.value.result.succeeded_ids == ["c-1", "c-8"]
@@ -430,9 +418,7 @@ class TestUpsertByMatchField:
     @respx.mock
     def test_a_timeout_in_the_upsert_keeps_airflows_exception_and_the_whole_report(self, tmp_path):
         respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A")))
-        respx.put(f"{BASE_URL}/companies/bulk/update").mock(
-            return_value=httpx.Response(200, json={"successfulIds": ["c-1"], "errors": {}})
-        )
+        respx.put(f"{BASE_URL}/companies/bulk/update").mock(return_value=_bulk_answer("c-1"))
 
         def timeout(request):
             raise AirflowTaskTimeout("execution_timeout reached")
@@ -447,7 +433,7 @@ class TestUpsertByMatchField:
                 operation="upsert",
                 match_field="external_key",
                 results_path=str(results),
-                records=[{"external_key": "N1"}, {"external_key": "A"}],
+                records=[_company("N1"), _company("A")],
             ).execute({})
 
         partial = raised.value.dreamhub_partial
@@ -458,10 +444,9 @@ class TestUpsertByMatchField:
 
     @respx.mock
     def test_an_error_before_the_upsert_sends_anything_still_reports_the_update(self, monkeypatch):
+        # Also the path a stop between the two requests takes: nothing after the update was sent.
         respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A")))
-        respx.put(f"{BASE_URL}/companies/bulk/update").mock(
-            return_value=httpx.Response(200, json={"successfulIds": ["c-1"], "errors": {}})
-        )
+        respx.put(f"{BASE_URL}/companies/bulk/update").mock(return_value=_bulk_answer("c-1"))
         bulk = DreamhubHook.bulk
 
         def refuse_upsert(self, entity, operation, records, **kwargs):
@@ -477,7 +462,7 @@ class TestUpsertByMatchField:
                 entity="companies",
                 operation="upsert",
                 match_field="external_key",
-                records=[{"external_key": "N1"}, {"external_key": "A"}],
+                records=[_company("N1"), _company("A")],
             ).execute({})
 
         assert raised.value.result.succeeded_ids == ["c-1"]
@@ -485,13 +470,11 @@ class TestUpsertByMatchField:
         assert isinstance(raised.value.__cause__, RuntimeError)
 
     @respx.mock
-    def test_unmatched_values_and_a_stop_in_the_upsert_are_reported_by_input_position(self):
+    def test_ambiguous_and_unusable_values_and_a_stop_in_the_upsert_are_reported_by_input_position(self):
         respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A"), ("c-2", "B"), ("c-3", "B")))
-        respx.put(f"{BASE_URL}/companies/bulk/update").mock(
-            return_value=httpx.Response(200, json={"successfulIds": ["c-1"], "errors": {}})
-        )
+        respx.put(f"{BASE_URL}/companies/bulk/update").mock(return_value=_bulk_answer("c-1"))
         respx.put(f"{BASE_URL}/companies/bulk/upsert").mock(
-            side_effect=[httpx.Response(201, json={"successfulIds": ["c-8"], "errors": {}}), httpx.Response(504)]
+            side_effect=[_bulk_answer("c-8", status=201), httpx.Response(504)]
         )
 
         with pytest.raises(DreamhubBulkError) as raised:
@@ -501,13 +484,7 @@ class TestUpsertByMatchField:
                 operation="upsert",
                 match_field="external_key",
                 batch_size=1,
-                records=[
-                    {"external_key": "A"},
-                    {"external_key": "B"},
-                    {"external_key": None},
-                    {"external_key": "N1"},
-                    {"external_key": "N2"},
-                ],
+                records=[_company("A"), _company("B"), _company(None), _company("N1"), _company("N2")],
             ).execute({})
 
         # Input 0 updated, 1 ambiguous, 2 unusable, 3 created, 4 in flight.
@@ -518,7 +495,7 @@ class TestUpsertByMatchField:
         ]
         assert (raised.value.unknown, raised.value.not_attempted) == ([4], [])
 
-    @pytest.mark.parametrize("records", [[], [{"external_key": None}]])
+    @pytest.mark.parametrize("records", [[], [_company(None)]])
     def test_nothing_to_send_still_checks_the_connection(self, monkeypatch, records):
         monkeypatch.setenv("AIRFLOW_CONN_DREAMHUB_NOTOKEN", json.dumps({"conn_type": "dreamhub", "host": BASE_URL}))
 
