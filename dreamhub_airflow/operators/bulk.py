@@ -240,9 +240,11 @@ class DreamhubBulkOperator(BaseOperator):
         """Write ``records`` and report by their positions in ``records``, whatever requests it took.
 
         ``matched`` is the number of leading records matched by ``match_field``, or None without it.
-        A run that stops anywhere, in a request or between two of them (an Airflow timeout can
-        land at any statement), raises one report covering all of them: what earlier requests
-        wrote, what was in flight, and every record not yet attempted.
+        A run that stops after a request started, in a request or between two of them (an Airflow
+        timeout can land at any statement), raises one report covering all of them: what finished
+        requests wrote, the records whose outcome is unknown, and every record not yet attempted.
+        When Airflow stops the task without a report from the hook, the running request's records
+        are reported as unknown, since it may already have been written.
         """
         # Each finished request is recorded the moment it returns, so a stop at any later point
         # still reports it; positions come from these records, never from a separate counter.
@@ -264,21 +266,29 @@ class DreamhubBulkOperator(BaseOperator):
             return self._merge(done)
         except BaseException as error:
             partial = error if isinstance(error, DreamhubBulkError) else getattr(error, "dreamhub_partial", None)
-            if not isinstance(partial, DreamhubBulkError) and not done:
-                raise  # stopped before anything was sent: there is nothing to report
+            finished = sum(len(positions) for _, positions in done)
+            # The request that was running when the stop hit, unless it had already been recorded.
+            running = [] if done and done[-1][1] is in_flight else in_flight
             result = self._merge(done)
-            sent = sum(len(positions) for _, positions in done)
             if isinstance(partial, DreamhubBulkError):
-                # The request in flight reported what it wrote before it stopped.
-                self._add(result, partial.result, in_flight)
-                unknown = [in_flight[i] for i in partial.unknown]
-                not_attempted = [in_flight[i] for i in partial.not_attempted]
-                not_attempted += list(range(sent + len(in_flight), len(records)))
+                # The running request reported what it wrote before it stopped.
+                self._add(result, partial.result, running)
+                unknown = [running[i] for i in partial.unknown]
+                not_attempted = [running[i] for i in partial.not_attempted]
                 cause = partial.cause
+            elif isinstance(error, Exception):
+                # The hook reports every error raised after it sent a batch, so a bare error means
+                # the running request sent nothing.
+                if not done:
+                    raise  # nothing was written at all: there is nothing to report
+                unknown, not_attempted, cause = [], list(running), error
             else:
-                # Stopped between requests, or in one before it sent anything: nothing after the
-                # finished requests was written.
-                unknown, not_attempted, cause = [], list(range(sent, len(records))), error
+                # Airflow stopped the task (a timeout or a kill) with no report from the hook: the
+                # running request may already have been written, so its records are unknown.
+                if not done and not running:
+                    raise  # stopped before any request started: there is nothing to report
+                unknown, not_attempted, cause = list(running), [], error
+            not_attempted += list(range(finished + len(running), len(records)))
             DreamhubBulkError(result, unknown, not_attempted, cause).propagate()
 
     def _merge(self, done: list[tuple[BulkResult, list[int]]]) -> BulkResult:

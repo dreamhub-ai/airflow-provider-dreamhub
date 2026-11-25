@@ -15,6 +15,7 @@ from dreamhub_airflow.hooks.dreamhub import DreamhubBulkError, DreamhubHook
 from dreamhub_airflow.operators.api import DreamhubApiOperator
 from dreamhub_airflow.operators.bulk import DreamhubBulkOperator, DreamhubRecordsFailedError
 from dreamhub_airflow.operators.extract import DreamhubExtractOperator
+from dreamhub_airflow.records import JsonValue, Record
 from tests.helpers import BASE_URL
 
 
@@ -261,17 +262,18 @@ class TestProviderRegistration:
         assert getattr(importlib.import_module(module), name) is DreamhubHook
 
 
-def _matched(*pairs):
+def _matched(*pairs: tuple[str, str]) -> httpx.Response:
     """A companies filter page holding (id, externalKey) pairs."""
     return _page("companies", [{"id": record_id, "externalKey": key} for record_id, key in pairs])
 
 
-def _company(key, **fields):
-    """A company record for the upsert tests: its ``external_key`` plus any fields the scenario needs."""
+def _company(key: str | None, **fields: JsonValue) -> Record:
+    """A company record for the upsert tests: its ``external_key`` (None for an unusable one) plus
+    any fields the scenario needs."""
     return {"external_key": key, **fields}
 
 
-def _bulk_answer(*ids, errors=None, status=None):
+def _bulk_answer(*ids: str, errors: dict[str, str] | None = None, status: int | None = None) -> httpx.Response:
     """A bulk endpoint's answer: the ids it wrote and its errors by key (HTTP 206 when there are errors)."""
     errors = errors or {}
     return httpx.Response(status or (206 if errors else 200), json={"successfulIds": list(ids), "errors": errors})
@@ -472,6 +474,33 @@ class TestUpsertByMatchField:
         assert raised.value.result.succeeded_ids == ["c-1"]
         assert (raised.value.unknown, raised.value.not_attempted) == ([], [0])
         assert isinstance(raised.value.__cause__, RuntimeError)
+
+    @respx.mock
+    def test_a_timeout_with_no_report_leaves_the_running_records_unknown(self, monkeypatch):
+        # Airflow can stop the task right after a request returned, before its result was kept;
+        # whether it was written is then unknown, so its records must not read as not attempted.
+        respx.post(f"{BASE_URL}/companies/filter").mock(return_value=_matched(("c-1", "A")))
+        upsert = respx.put(f"{BASE_URL}/companies/bulk/upsert")
+
+        def timeout(self, entity, operation, records, **kwargs):
+            raise AirflowTaskTimeout("execution_timeout reached")
+
+        monkeypatch.setattr(DreamhubHook, "bulk", timeout)
+
+        with pytest.raises(AirflowTaskTimeout) as raised:
+            DreamhubBulkOperator(
+                task_id="load",
+                entity="companies",
+                operation="upsert",
+                match_field="external_key",
+                records=[_company("N1"), _company("A")],
+            ).execute({})
+
+        partial = raised.value.dreamhub_partial
+        assert partial.result.succeeded_ids == []
+        # Input 1 (matched, in the update) is unknown; input 0 (new) was never sent.
+        assert (partial.unknown, partial.not_attempted) == ([1], [0])
+        assert upsert.call_count == 0
 
     @respx.mock
     def test_ambiguous_and_unusable_values_and_a_stop_in_the_upsert_are_reported_by_input_position(self):
